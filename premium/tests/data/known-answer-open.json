@@ -1,0 +1,25 @@
+{
+ "_doc": "Known-open ledger for premium/tests/known-answer-critical.test.js. Each key is a case that fails today because of the named, still-OPEN register entry in docs/DEFERRED-WORK-REGISTER.md. Remove a key in the same change that fixes its defect; the test fails if a listed case passes. premium/tests/register-check.js checks every id here names an open entry.",
+ "open": {
+  "KA-13": "GH-DEF-049",
+  "KA-14": "GH-DEF-049",
+  "KA-18": "GH-DEF-051",
+  "KA-19": "GH-DEF-051",
+  "KA-20": "GH-DEF-051",
+  "KA-21": "GH-DEF-052",
+  "KA-30": "GH-DEF-056",
+  "KA-32": "GH-DEF-058",
+  "KA-33": "GH-DEF-058",
+  "KA-34": "GH-DEF-058",
+  "KA-35": "GH-DEF-058",
+  "KA-36": "GH-DEF-058",
+  "KA-37": "GH-DEF-058",
+  "KA-38": "GH-DEF-058",
+  "KA-39": "GH-DEF-058",
+  "KA-40": "GH-DEF-058",
+  "KA-41": "GH-DEF-059",
+  "KA-42": "GH-DEF-059",
+  "KA-43": "GH-DEF-059",
+  "KA-44": "GH-DEF-059"
+ }
+}
