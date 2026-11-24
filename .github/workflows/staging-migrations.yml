@@ -1,10 +1,11 @@
 # Gearhead Labs STAGING - apply PR #31's migrations to the staging Supabase project
 # File: .github/workflows/staging-migrations.yml in highandmighty354-dev/gearhead-labs-staging ONLY.
 #
-# PROPOSAL FOR OWNER REVIEW, revision 3 (2026-11-21). Not committed anywhere. Never run.
+# PROPOSAL FOR OWNER REVIEW, revision 4 (2026-11-23). Not committed; revision 3 (c1c3588e) is the committed version.
 # Revision 3: project refs may contain digits ([a-z0-9]{20}); every database connection verifies TLS against the two
 # pinned Supabase root CAs with hostname checking (verify-full), plus a TLS probe before the password exists; the
 # staging-db Environment's protection settings are read from GitHub and must match before anything runs.
+# Revision 4: the TLS probe accepts OpenSSL's verified wildcard peer name; OpenSSL still does the hostname check.
 #
 # What this workflow can do: apply the 20 approved migration files, in two stages, to the ONE Supabase
 # project named in this repository's settings, after you approve each run.
@@ -346,7 +347,9 @@ env:
       printf '%s\n' "$out" | sed 's/^/  tls: /' >&2
       [ "$rc" -eq 0 ] || fail "TLS check of $host failed: the certificate is not from a pinned Supabase root, does not name $host, has expired, or TLS is not offered"
       printf '%s\n' "$out" | grep -qx 'Verification: OK' || fail "TLS check of $host did not report 'Verification: OK'"
-      printf '%s\n' "$out" | grep -qxF "Verified peername: $host" || fail "TLS check of $host did not confirm the hostname"
+      # OpenSSL prints "Verified peername" only after -verify_hostname matched; for a wildcard certificate it prints
+      # the certificate name that matched (e.g. *.pooler.supabase.com), not $host, so only its presence is required.
+      printf '%s\n' "$out" | grep -q '^Verified peername: [^ ]' || fail "TLS check of $host did not confirm the hostname"
       echo "TLS OK: $host presents a certificate chaining to a pinned Supabase root and naming $host"
     }
 
