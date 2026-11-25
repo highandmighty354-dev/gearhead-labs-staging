@@ -4,7 +4,7 @@
  "generated_from": {
   "catalog": {
    "file": "catalog/gearhead-catalog.json",
-   "sha256": "eec0acd697d65ed7da60fdf6e425c20bfeefe3009dc9da4174ade60404e8f08e"
+   "sha256": "a065f70215879082bac6a2bb663ed5503b3c93da977d421d9526d1b6f3d660ef"
   },
   "enrichment": {
    "file": "catalog/encyclopedia-enrichment.json",
@@ -12,7 +12,7 @@
   },
   "page": {
    "file": "F1_12_4_Gearhead_Labs_Automotive_Math_Encyclopedia_Universal_batch9_1.html",
-   "sha256": "e4911ee979c94597c4c44c61a2e1ba2e75762937a45f12251dccb2522c3e8b38"
+   "sha256": "c0dbbfeb85ae980a399b38c1704417e88a715b63008e6b442260aadbf8c90154"
   },
   "models": {
    "file": "premium/models.js",

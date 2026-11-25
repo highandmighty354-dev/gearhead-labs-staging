@@ -1,0 +1,662 @@
+# Gearhead Labs STAGING - hosted validation of the staging site and staging database (checks S1-S4 of the staging plan)
+# File: .github/workflows/staging-validation.yml in highandmighty354-dev/gearhead-labs-staging ONLY.
+#
+# Validation package Draft 3 (package SHA-256 31c1b1c90b580110f5396ad34ec8b640d0e814c527b02d80582cb738d992b027),
+# committed to this repository through PR #1, plus two owner-approved corrections made in PR #1 after Draft 3: this header,
+# and a stricter staging-address guard in .github/validation/site_check.mjs (re-pinned below).
+# Runs only when started by hand from main, after PR #1 is merged and GitHub Pages is turned on, and its database job
+# waits for the owner's approval on every run. Its files in .github/validation/ are hash-pinned below.
+#
+# What it checks, all against the ONE staging project pinned below:
+#   preflight   (no secret)                 how the run started, the typed project ref, the pinned staging target, the 20
+#                                           migration files, the validation files, the approval gate, the Pages build of
+#                                           THIS commit, and the database's TLS certificate (no password)
+#   repo-tests  (no secret)                 fast gate (9 steps) and the full browser regression (51 suites), including the
+#                                           4 suites that need old file versions, which come from a hash-pinned history pack
+#   site        (no secret)                 A1 served files = this commit; A2 served config = staging only; A4 every page
+#                                           noindex and no Markdown published; A3 the live page connects to staging with
+#                                           0 errors; B2 known-answer suite on the SERVED engine; S3 anonymous web-API
+#                                           requests are all refused
+#   database    (Environment staging-db)    WAITS FOR YOUR APPROVAL. Protection audit against a replica built from the
+#                                           migration files, two-user access matrix in a transaction that cannot commit,
+#                                           formula-version checks, before/after counts. Only ONE step gets the password.
+# What it cannot do: start on its own, run on another branch or repository, re-run, deploy, push, or reach any project
+# other than the pinned staging project. It changes nothing: every database write happens inside one transaction that
+# always ends in a deliberate error (rolled back), and the before/after counts prove it.
+# Not covered here (stay manual or connector checks, see the plan): the Supabase security advisor, real email sign-in,
+# phone layout, two-tab defects GH-DEF-070/071, and production's state.
+
+name: Staging validation (manual, approval-gated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_project_ref:
+        description: "Type the STAGING project ref exactly (20 lowercase letters/digits)."
+        type: string
+        required: true
+
+permissions: {}            # nothing at workflow level; each job asks for the least it needs
+
+# Shared lock with staging-migrations.yml. GitHub concurrency groups are repository-wide, so using the SAME group name as
+# the committed migration workflow means a validation run and a migration run can never be in progress together: whichever
+# starts second waits as "pending" until the first finishes. Neither workflow cancels a running run (cancel-in-progress:
+# false). GitHub keeps at most one waiting run per group; a newer waiting run replaces an older one, and the replaced run
+# is cancelled before it started anything. check_shared_lock refuses to run unless both files still declare this lock.
+concurrency:
+  group: staging-migrations
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash            # bash --noprofile --norc -eo pipefail {0}
+
+env:
+  STAGING_REPOSITORY: "highandmighty354-dev/gearhead-labs-staging"
+  STAGING_REF: "npizzzfvbtrlpnxfhqks"                                        # the ONLY project this workflow accepts
+  STAGING_SITE_URL: "https://highandmighty354-dev.github.io/gearhead-labs-staging/"
+  SHARED_LOCK_GROUP: "staging-migrations"                                    # concurrency group shared with staging-migrations.yml
+  APPROVAL_ENVIRONMENT: "staging-db"
+  APPROVER_LOGIN: "highandmighty354-dev"
+  PLAYWRIGHT_VERSION: "1.63.0"                                               # same pin as the calculator test workflow
+  # PyYAML for check_shared_lock: exact version and the SHA-256 of its two binary wheels on PyPI (CPython 3.12 = the
+  # ubuntu-24.04 runner's python3, and 3.13). pip installs only a wheel whose hash is listed, into a private folder.
+  PYYAML_VERSION: "6.0.3"
+  PYYAML_SHA256: "ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc 0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6"
+  NO_COLOR: "1"
+  # SHA-256 of every file this workflow executes or trusts that is not the application itself. A change to any of them
+  # needs a matching, reviewed change to this list, or every job stops.
+  VALIDATION_FILES_SHA256: |
+    6bc2d5cd0d0cc5d2c76d42a3ce9d9ac2760f9f6fdd8aff316c1c221fbfc00244  .github/validation/README.md
+    aa6ebc10f1c1050d2c83ec395fccc4213d07dec1edc1999e906c72fdac8224c3  .github/validation/db-audit.sql
+    acaf04f285392357a06eb9d6a0a8cb7bb09cc47f34c28e7045405009c0571733  .github/validation/db-counts.sql
+    1c790e82e33b806605639cab24bd464f02571e777a5b0f9a31e800a5f5d119c5  .github/validation/db-matrix.sql
+    38fe9906342a925479ea639981faf99ae9729f29310035999dcc9d1fc122bca0  .github/validation/db_check.py
+    a41a92515343feeea31154669d7a2f72e203e653330250bc03058b7938fbccbd  .github/validation/expected.json
+    4afcaeb10be548c4e604d38e89a50fef36bab2b3c258cc463f082df0d12a170e  .github/validation/history.pack
+    cea04901f64e959ee70a8d4e40e32dd545d6e54d1a047ab3f3ff91464d311d51  .github/validation/history.txt
+    0e8cab0d423a80bbf38509459c33ff3f0a8a8ec245e08f70991ae053ec6ebc6e  .github/validation/site_check.mjs
+    68596434d3238152aac665618b5b013812bba0494933f6c59d1c94869e9437cd  premium-foundation/tests/sql/000_hosted_supabase_shim.sql
+  # Supabase's two root CAs (from github.com/supabase/cli tag v2.119.0), identical to staging-migrations.yml.
+  SUPABASE_ROOT_CA_SHA256_FINGERPRINTS: "5F9B77951A7AA1303F9B58EEA9BFA89E358CFDC15F9786FF10D4930A722C9AE2 807025AD50D4ED219D2C9C7D299C004F824EB00CF7F65AFEF607D07B72E6CAFA"
+  SUPABASE_ROOT_CA_PEM: |
+    -----BEGIN CERTIFICATE-----
+    MIIDxDCCAqygAwIBAgIUbLxMod62P2ktCiAkxnKJwtE9VPYwDQYJKoZIhvcNAQEL
+    BQAwazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l
+    dyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJh
+    c2UgUm9vdCAyMDIxIENBMB4XDTIxMDQyODEwNTY1M1oXDTMxMDQyNjEwNTY1M1ow
+    azELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5ldyBD
+    YXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug
+    Um9vdCAyMDIxIENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqQXW
+    QyHOB+qR2GJobCq/CBmQ40G0oDmCC3mzVnn8sv4XNeWtE5XcEL0uVih7Jo4Dkx1Q
+    DmGHBH1zDfgs2qXiLb6xpw/CKQPypZW1JssOTMIfQppNQ87K75Ya0p25Y3ePS2t2
+    GtvHxNjUV6kjOZjEn2yWEcBdpOVCUYBVFBNMB4YBHkNRDa/+S4uywAoaTWnCJLUi
+    cvTlHmMw6xSQQn1UfRQHk50DMCEJ7Cy1RxrZJrkXXRP3LqQL2ijJ6F4yMfh+Gyb4
+    O4XajoVj/+R4GwywKYrrS8PrSNtwxr5StlQO8zIQUSMiq26wM8mgELFlS/32Uclt
+    NaQ1xBRizkzpZct9DwIDAQABo2AwXjALBgNVHQ8EBAMCAQYwHQYDVR0OBBYEFKjX
+    uXY32CztkhImng4yJNUtaUYsMB8GA1UdIwQYMBaAFKjXuXY32CztkhImng4yJNUt
+    aUYsMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAB8spzNn+4VU
+    tVxbdMaX+39Z50sc7uATmus16jmmHjhIHz+l/9GlJ5KqAMOx26mPZgfzG7oneL2b
+    VW+WgYUkTT3XEPFWnTp2RJwQao8/tYPXWEJDc0WVQHrpmnWOFKU/d3MqBgBm5y+6
+    jB81TU/RG2rVerPDWP+1MMcNNy0491CTL5XQZ7JfDJJ9CCmXSdtTl4uUQnSuv/Qx
+    Cea13BX2ZgJc7Au30vihLhub52De4P/4gonKsNHYdbWjg7OWKwNv/zitGDVDB9Y2
+    CMTyZKG3XEu5Ghl1LEnI3QmEKsqaCLv12BnVjbkSeZsMnevJPs1Ye6TjjJwdik5P
+    o/bKiIz+Fq8=
+    -----END CERTIFICATE-----
+    -----BEGIN CERTIFICATE-----
+    MIIDxzCCAq+gAwIBAgIUeX+gpfmsRW9asFkRvjyXjHxbfgcwDQYJKoZIhvcNAQEL
+    BQAwazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l
+    dyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJh
+    c2UgUm9vdCAyMDIxIENBMB4XDTI1MDkwMzA4MDEyNVoXDTM1MDkwMTA4MDEyNVow
+    azELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5ldyBD
+    YXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug
+    Um9vdCAyMDIxIENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5Ve7
+    i9UAmc7luUilELPtqzEk8nGHxg7nY0aCStr625M7+K4OPO6RUllTsHh47k1jWyzm
+    LXLlyYwCsYCjQp+3vn06H+F/HRUxBt6CK2B7bNng230exTunk0xFvfkX6YgHR7B3
+    1B7L25Rq3PhuRFPV4hnGYRam2XBZC4UNPqoAgrhV0HOYzXXAVoTr2yaBTMnB331Z
+    RwOmINh7eqTCk/JRZbb6vfZOhZRAVAe9AoRLoG8aKwmeoLGwlu0UuFx6z3E+6bmA
+    fSNa8Lx02GEoCdPLw9IRKUFq/SgBpQUKm44H1fDwTjH2CMM0N4p0mL/6wXnNeHvt
+    C40MmKZ0RcVmHE5wBwIDAQABo2MwYTAdBgNVHQ4EFgQUjvEE541toZcwtXQlZlcB
+    YOBRTnowHwYDVR0jBBgwFoAUjvEE541toZcwtXQlZlcBYOBRTnowDwYDVR0TAQH/
+    BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggEBACD5IcGP
+    XKvS9qg0CgEQPFqYavt5c7P+0xxFgiZe+xoG8fUw58yNeK2APtgGPRpxEOGfAlNx
+    z9HDt4gcyHEE00B3qAVDm49pqNxioFWzNqU2LGfM/HL1QmN6urR7hCOkVCJddvOc
+    FhFX4nZDuRfaBboDvS5HlK3Pzxddp9hvrJi2bemr8HLqYc3HzmVckgPGSLML6t+h
+    4LRCXSlQsDgQ1LZ4KHsl4cq7K51N6FOXQBLB5q4lMKhs0VUhCT8Pdsj12+84laCV
+    c22q6p2mdT9SaernCSRnWazXWisgpjv3H7Ex4S1DCYjJIwn3PUToGFv1r8YRN2/S
+    O19yVSxxCIf64Sg=
+    -----END CERTIFICATE-----
+  # Shared checks, written to a file and sourced by the steps that need them. No network except where named, no secret.
+  # Every failure prints "HARD FAIL: <reason>" and exits non-zero, which stops the job and fails the run.
+  CHECKS_SH: |
+    set -euo pipefail
+    LC_ALL=C; export LC_ALL
+    fail() { echo "::error::$*" >&2; echo "HARD FAIL: $*" >&2; exit 1; }
+
+    # How this run was started (all jobs repeat this).
+    check_context() {
+      [ "${EVENT:-}" = workflow_dispatch ] || fail "started by '${EVENT:-?}', not by the Run workflow button"
+      [ "${REPO:-}" = "$STAGING_REPOSITORY" ] || fail "running in '${REPO:-?}', not $STAGING_REPOSITORY"
+      [ "${GIT_REF:-}" = refs/heads/main ] || fail "started from '${GIT_REF:-?}', not refs/heads/main"
+      [ "${RUN_ATTEMPT:-}" = 1 ] || fail "re-run attempt ${RUN_ATTEMPT:-?} refused: start a new run (new confirmation, new approval)"
+      [ "$(git rev-parse HEAD 2>/dev/null || echo none)" = "${COMMIT:-}" ] || [ ! -d .git ] || fail "checked-out commit is not the run's commit"
+    }
+
+    # The validation files and the replica shim, each against the SHA-256 pinned in this workflow. Exact set, no extras.
+    verify_validation_files() {
+      local list="$RUNNER_TEMP/validation.sha256" expected actual
+      printf '%s\n' "$VALIDATION_FILES_SHA256" | sed -e 's/^[[:space:]]*//' -e '/^$/d' > "$list"
+      [ "$(grep -c . "$list")" -ge 8 ] || fail "the pinned validation file list is incomplete"
+      sha256sum --strict --quiet -c "$list" || fail "a validation file does not match its pinned SHA-256"
+      expected="$(awk '{print $2}' "$list" | grep '^\.github/validation/' | sort)"
+      actual="$(find .github/validation -type f | sort)"
+      [ "$expected" = "$actual" ] || { diff <(echo "$expected") <(echo "$actual") >&2 || true; fail ".github/validation holds files that are not pinned, or misses pinned files"; }
+      [ -z "$(find .github/validation -mindepth 1 ! -type f ! -type d)" ] || fail ".github/validation holds a link or special file"
+    }
+
+    # The 20 migration files, unchanged (same hashes as staging-migrations.yml). The replica is built from these.
+    write_manifest() {
+      cat > "$1" <<'EOF'
+    e6ff6301b302bd794ee6bdb1ddc65cc2ebd9de9c8e27c141ae5403b2092432e6  0001_enums.sql
+    5332f1396283b1d106cfe9c719cedae24069bef317e738b760a76c2131b3c947  0002_tables.sql
+    e1e241f7422c9040b2b8bd6ddaecafb2b55bc4b3a4a4d375546b7ef7f3c59e3a  0003_constraints_triggers.sql
+    8663ab2b5e6e4a5f16d6d781d1e26c915197541a7ce8e083d8a27eb07c27fcdb  0004_rls.sql
+    7bebd26f100c9f8010539a9052988d28b289349d89ed3abd4ff4431dabfdd14f  0005_reference_seed.sql
+    a3256a08de2f25e7c52f0f26cb6be32f1b16b999b29e6b3c0abf65e7d773b5b4  0101_test_setups.sql
+    7ba5b02fd016c45b45043e3358dd4683076216eae028a3f3ca597e886759dea4  0102_test_setups_triggers.sql
+    b1f778b9d13117a270f8240702bb2678543552a54f6f91f55acef478104bfae8  0103_test_setups_rls.sql
+    ccc6bb56f070f67b972026972a3ec1c963c180c045996ff1551ffa6be485ae09  0201_value_write_boundary.sql
+    b5f7fbe495403d5367fb5dde2850bcbf20d46295997e928dc25bae1987c1bea1  0301_value_foundation_v1_seed.sql
+    6174b0f7b2b43022fbda2248f2e824c082062d50fcdf54e5a0c69893ea10fc62  0401_automotive_only.sql
+    f962e8f00b2830957b90bf40406eaf1b91469dacde9292028d8d21085c3312c7  0402_premium_entitlements.sql
+    3309328906074246bb3c13dacb2818107d3a926260352b72581a9180f5c5c35f  0403_premium_profiles.sql
+    0c89dd3a1b3949b998cedb0fe075db78668878ff2216a32d00eddbd07c0bcc6e  0404_premium_garage.sql
+    c63a2d1803b0a90e685e64688943602064a111db862244e41d50f89badde49b0  0405_premium_saved_calculations.sql
+    75eccb9260a0265be95bbe5f5d34981ba482ad08bc4ff5ee14225839e1e43f43  0406_premium_engineering_analyses.sql
+    e5e0cb582c9ed19c17134bace602f539697ae3f10af813f08486de6a5181de70  0407_premium_product_model.sql
+    df92a3e050bc7cbc46d5e1c1d6fe3822a7a82db58a2ebc5fe3965138380c4c49  0408_formula_versions_corrected_formulas.sql
+    29cbdcd08bda08630126e65f89a99f1226766d8568c58330486f3262d61f5534  0409_formula_versions_fuel_pump_validity.sql
+    355c0c137a94b9683e9f9b31af381361716f1f4017a0513a6dcae6bbf890905e  0410_formula_versions_stage2_calculator_repairs.sql
+    EOF
+    }
+    verify_migration_files() {
+      local dir=supabase/migrations man="$RUNNER_TEMP/manifest.sha256" expected actual
+      write_manifest "$man"
+      [ -d "$dir" ] && [ ! -L "$dir" ] || fail "$dir is missing or is a link"
+      expected="$(awk '{print $2}' "$man" | sort)"; actual="$(find "$dir" -mindepth 1 -printf '%P\n' | sort)"
+      [ "$expected" = "$actual" ] || fail "$dir does not hold exactly the 20 approved files"
+      ( cd "$dir" && sha256sum --strict --quiet -c "$man" ) || fail "a migration file does not match its approved SHA-256"
+    }
+
+    # The staging target, five ways, all of which must name the ONE pinned project. Allow-list only: any other project
+    # (production included) fails because it is not the pinned staging project; no other project is named here.
+    verify_target() {
+      local pinned="$STAGING_REF" expected="${EXPECTED_TEST_REF:-}" typed="${CONFIRM_REF:-}" url="${POOLER_URL:-}" ref site_refs
+      [[ $pinned =~ ^[a-z0-9]{20}$ ]] || fail "the pinned STAGING_REF is malformed"
+      [ "$expected" = "$pinned" ] || fail "repository variable EXPECTED_TEST_REF is not the pinned staging project"
+      [ "$typed" = "$pinned" ] || fail "the typed project ref is not the pinned staging project"
+      ref="$(printf '%s' "$url" | sed -nE 's#^postgres(ql)?://postgres\.([a-z0-9]{20}):\[YOUR-PASSWORD\]@aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com:5432/postgres$#\2#p')"
+      [ -n "$ref" ] || fail "STAGING_POOLER_URL is not an unmodified Session pooler string"
+      [ "$ref" = "$pinned" ] || fail "STAGING_POOLER_URL is not for the pinned staging project"
+      [ -f supabase-config.js ] && [ ! -L supabase-config.js ] || fail "supabase-config.js is missing"
+      site_refs="$(grep -oE 'https://[a-z0-9]+\.supabase\.co' supabase-config.js | sort -u)"
+      [ "$site_refs" = "https://$pinned.supabase.co" ] || fail "supabase-config.js does not name exactly the pinned staging project"
+    }
+    pooler_host() {
+      printf '%s' "${POOLER_URL:-}" | sed -nE 's#^postgres(ql)?://postgres\.[a-z0-9]{20}:\[YOUR-PASSWORD\]@(aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com):5432/postgres$#\2#p'
+    }
+
+    # TLS: identical to staging-migrations.yml revision 4 (pinned roots, chain + hostname, no system CA store).
+    write_ca() {
+      local file="$1" got
+      printf '%s' "$SUPABASE_ROOT_CA_PEM" > "$file"
+      [ "$(grep -c -- '-----BEGIN CERTIFICATE-----' "$file")" = 2 ] || fail "the pinned CA bundle does not hold exactly 2 certificates"
+      got="$(python3 - "$file" <<'PYEOF'
+    import hashlib, re, ssl, sys
+    pem = open(sys.argv[1]).read()
+    blocks = re.findall(r"-----BEGIN CERTIFICATE-----\n.*?\n-----END CERTIFICATE-----", pem, re.S)
+    print(" ".join(sorted(hashlib.sha256(ssl.PEM_cert_to_DER_cert(b + "\n")).hexdigest().upper() for b in blocks)))
+    PYEOF
+    )" || fail "the pinned CA bundle could not be read"
+      [ "$got" = "$SUPABASE_ROOT_CA_SHA256_FINGERPRINTS" ] || fail "the CA bundle is not the two pinned Supabase roots"
+      chmod a-w "$file"
+    }
+    tls_probe() {
+      local host="$1" ca="$2" out rc=0
+      [ -n "$host" ] || fail "no pooler host to check"
+      out="$(timeout 30 openssl s_client -starttls postgres -connect "$host:5432" -servername "$host" \
+               -verify_hostname "$host" -verify_return_error -CAfile "$ca" -no-CApath -no-CAstore -brief < /dev/null 2>&1)" || rc=$?
+      printf '%s\n' "$out" | sed 's/^/  tls: /' >&2
+      [ "$rc" -eq 0 ] || fail "TLS check of $host failed"
+      printf '%s\n' "$out" | grep -qx 'Verification: OK' || fail "TLS check of $host did not report 'Verification: OK'"
+      printf '%s\n' "$out" | grep -q '^Verified peername: [^ ]' || fail "TLS check of $host did not confirm the hostname"
+      echo "TLS OK: $host presents a certificate chaining to a pinned Supabase root and naming $host"
+    }
+
+    # The approval gate, read back from GitHub: identical rules to staging-migrations.yml revision 4.
+    gh_api() {   # gh_api PATH OUTFILE: read-only GET with the job's token; any HTTP error fails
+      [[ ${GITHUB_API_URL:-} == https://* ]] || fail "GITHUB_API_URL is not https"
+      [ -n "${GH_TOKEN:-}" ] || fail "no read token"
+      curl --fail --silent --show-error --proto '=https' -H "Authorization: Bearer $GH_TOKEN" \
+           -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" -o "$2" "$GITHUB_API_URL$1"
+    }
+    check_environment() {
+      local base="/repos/$REPO/environments/$APPROVAL_ENVIRONMENT"
+      gh_api "$base" "$RUNNER_TEMP/env.json" || fail "could not read Environment $APPROVAL_ENVIRONMENT"
+      gh_api "$base/deployment-branch-policies" "$RUNNER_TEMP/env-branches.json" || fail "could not read the branch rule of $APPROVAL_ENVIRONMENT"
+      python3 - "$RUNNER_TEMP/env.json" "$RUNNER_TEMP/env-branches.json" <<'PYEOF' || fail "Environment $APPROVAL_ENVIRONMENT is not configured as required"
+    import json, os, sys
+    env = json.load(open(sys.argv[1])); br = json.load(open(sys.argv[2]))
+    want_env, approver = os.environ["APPROVAL_ENVIRONMENT"], os.environ["APPROVER_LOGIN"]
+    def no(msg): print("HARD FAIL: " + msg, file=sys.stderr); sys.exit(1)
+    if env.get("name") != want_env: no(f"the Environment read back is {env.get('name')!r}")
+    rules = env.get("protection_rules") or []
+    kinds = [r.get("type") for r in rules]
+    unknown = sorted(set(kinds) - {"required_reviewers", "branch_policy", "wait_timer"})
+    if unknown: no(f"unexpected protection rule type(s) {unknown}")
+    rr = [r for r in rules if r.get("type") == "required_reviewers"]
+    if len(rr) != 1: no("the Environment has no required-reviewers rule")
+    if rr[0].get("prevent_self_review") is not False: no("'Prevent self-review' must be OFF (one-owner setup)")
+    revs = [(x.get("type"), (x.get("reviewer") or {}).get("login")) for x in (rr[0].get("reviewers") or [])]
+    if revs != [("User", approver)]: no(f"required reviewers must be exactly the user {approver}; found {revs}")
+    if "branch_policy" not in kinds: no("the Environment has no branch rule")
+    if env.get("deployment_branch_policy") != {"protected_branches": False, "custom_branch_policies": True}:
+        no(f"deployment branches must be 'Selected branches and tags'; found {env.get('deployment_branch_policy')}")
+    pols = [(p.get("name"), p.get("type", "branch")) for p in br.get("branch_policies", [])]
+    if br.get("total_count") != 1 or pols != [("main", "branch")]: no(f"the only allowed deployment branch must be 'main'; found {pols}")
+    print(f"Approval gate OK: {want_env} requires {approver}, self-review allowed (no deadlock), branch main only")
+    PYEOF
+    }
+
+    # The shared lock (see "concurrency" above): both workflow files in this commit must declare the same workflow-level
+    # group, never cancel a running run, use GitHub's default single-pending queue, and declare no job-level concurrency.
+    # PyYAML, declared and pinned: exact version, binary wheels only, every file checked against PYYAML_SHA256, installed
+    # into a private folder ($RUNNER_TEMP/pydeps) that check_shared_lock loads it from. Nothing preinstalled is used.
+    install_pyyaml() {
+      local dir="$RUNNER_TEMP/pydeps" req="$RUNNER_TEMP/pyyaml-requirements.txt" h line
+      [[ $PYYAML_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "PYYAML_VERSION is not an exact version"
+      line="PyYAML==$PYYAML_VERSION"
+      for h in $PYYAML_SHA256; do [[ $h =~ ^[0-9a-f]{64}$ ]] || fail "a PYYAML_SHA256 entry is not a SHA-256"; line+=" --hash=sha256:$h"; done
+      [[ $line == *--hash=* ]] || fail "no PyYAML hash is pinned"
+      printf '%s\n' "$line" > "$req"
+      rm -rf "$dir"
+      python3 -m pip install --disable-pip-version-check --no-cache-dir --no-input --no-deps --only-binary=:all: \
+          --require-hashes --target "$dir" -r "$req" > "$RUNNER_TEMP/pyyaml-install.log" 2>&1 \
+        || { cat "$RUNNER_TEMP/pyyaml-install.log" >&2; fail "PyYAML $PYYAML_VERSION could not be installed with a pinned hash"; }
+      echo "PyYAML $PYYAML_VERSION installed from a hash-pinned wheel into $dir"
+    }
+    check_shared_lock() {
+      python3 - .github/workflows/staging-validation.yml .github/workflows/staging-migrations.yml <<'PYEOF' || fail "the shared lock between the validation and migration workflows is not in place"
+    import os, sys
+    deps = os.path.join(os.environ["RUNNER_TEMP"], "pydeps")
+    sys.path.insert(0, deps)
+    try:
+        import yaml
+    except ImportError:
+        print("HARD FAIL: the pinned PyYAML is not installed (run install_pyyaml): the shared lock cannot be verified", file=sys.stderr); sys.exit(1)
+    if getattr(yaml, "__version__", None) != os.environ["PYYAML_VERSION"] or not os.path.realpath(yaml.__file__).startswith(os.path.realpath(deps) + os.sep):
+        print(f"HARD FAIL: PyYAML {getattr(yaml, '__version__', '?')} from {yaml.__file__} is not the pinned {os.environ['PYYAML_VERSION']} in {deps}", file=sys.stderr); sys.exit(1)
+    want = os.environ["SHARED_LOCK_GROUP"]
+    def no(msg): print("HARD FAIL: " + msg, file=sys.stderr); sys.exit(1)
+    for path in sys.argv[1:]:
+        if not os.path.isfile(path) or os.path.islink(path): no(f"{path} is missing")
+        wf = yaml.safe_load(open(path))
+        c = wf.get("concurrency")
+        if not isinstance(c, dict): no(f"{path}: no workflow-level concurrency block")
+        if str(c.get("group", "")).lower() != want.lower(): no(f"{path}: concurrency group is {c.get('group')!r}, not the shared {want!r}")
+        if c.get("cancel-in-progress") is not False: no(f"{path}: cancel-in-progress must be false (a new run must never cancel a running one)")
+        if "queue" in c: no(f"{path}: a 'queue' setting is present; the lock is reviewed only for GitHub's default single-pending queue")
+        for name, job in (wf.get("jobs") or {}).items():
+            if isinstance(job, dict) and "concurrency" in job: no(f"{path}: job {name!r} declares its own concurrency")
+    print(f"Shared lock OK: both workflows hold workflow-level concurrency group {want!r}, cancel-in-progress false")
+    PYEOF
+    }
+    # Breach detector, a second line behind the lock: while this run holds the group, a migration run may only be waiting
+    # its turn ("pending") or finished. Any other state means the lock did not hold (for example, a later commit changed
+    # the migration workflow's group), so stop.
+    check_no_migration_running() {
+      gh_api "/repos/$REPO/actions/workflows/staging-migrations.yml/runs?per_page=50" "$RUNNER_TEMP/migration-runs.json" \
+        || fail "could not read the staging-migrations workflow's runs"
+      python3 - "$RUNNER_TEMP/migration-runs.json" <<'PYEOF' || fail "a staging migration run is active while this run holds the shared lock"
+    import json, sys
+    runs = json.load(open(sys.argv[1])).get("workflow_runs")
+    if runs is None: print("HARD FAIL: unexpected answer from GitHub", file=sys.stderr); sys.exit(1)
+    active = [(r.get("id"), r.get("status")) for r in runs if r.get("status") not in ("completed", "pending")]
+    if active: print(f"HARD FAIL: migration run(s) active despite the shared lock: {active}", file=sys.stderr); sys.exit(1)
+    waiting = [r.get("id") for r in runs if r.get("status") == "pending"]
+    print(f"No migration run active ({len(runs)} recent run(s); {len(waiting)} waiting for this run to finish)")
+    PYEOF
+    }
+
+    # GitHub Pages must be serving THIS commit from main, at the pinned address, over HTTPS.
+    check_pages() {
+      gh_api "/repos/$REPO/pages" "$RUNNER_TEMP/pages.json" || fail "GitHub Pages is not enabled for $REPO (or cannot be read)"
+      gh_api "/repos/$REPO/pages/builds/latest" "$RUNNER_TEMP/pages-build.json" || fail "the latest Pages build cannot be read"
+      python3 - "$RUNNER_TEMP/pages.json" "$RUNNER_TEMP/pages-build.json" <<'PYEOF' || fail "GitHub Pages is not serving this commit as required"
+    import json, os, sys
+    p = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
+    def no(msg): print("HARD FAIL: " + msg, file=sys.stderr); sys.exit(1)
+    if p.get("html_url") != os.environ["STAGING_SITE_URL"]: no(f"Pages address is {p.get('html_url')!r}, not {os.environ['STAGING_SITE_URL']!r}")
+    if p.get("cname"): no(f"a custom domain is set ({p.get('cname')!r}); staging must use its github.io address")
+    src = p.get("source") or {}
+    if (src.get("branch"), src.get("path")) != ("main", "/"): no(f"Pages must publish branch main, folder /; found {src}")
+    if p.get("public") is not True and p.get("public") is not None: no("unexpected Pages visibility")
+    if b.get("status") != "built": no(f"the latest Pages build status is {b.get('status')!r}, not 'built'")
+    if b.get("commit") != os.environ["COMMIT"]: no(f"Pages is serving commit {b.get('commit')}, not this run's commit {os.environ['COMMIT']}")
+    print(f"Pages OK: {p.get('html_url')} serves commit {b.get('commit')} (build finished {b.get('updated_at')})")
+    PYEOF
+    }
+
+    # Old file versions for the four suites that test against them (mutants). Imported from the pinned history pack into
+    # the job's own clone; every needed (revision, path) must resolve to its pinned blob. Nothing is fetched from anywhere.
+    import_history() {
+      local rev commit path blob got n=0
+      git index-pack --stdin < .github/validation/history.pack > /dev/null || fail "the history pack could not be indexed"
+      while read -r rev commit path blob; do
+        [ "$(git rev-parse --verify --quiet "$rev^{commit}")" = "$commit" ] || fail "history: $rev is not commit $commit"
+        got="$(git rev-parse --verify --quiet "$rev:$path" || true)"
+        [ "$got" = "$blob" ] || fail "history: $rev:$path is ${got:-missing}, not the pinned blob $blob"
+        git cat-file -e "$blob" || fail "history: blob $blob is not readable"
+        n=$((n + 1))
+      done < .github/validation/history.txt
+      [ "$n" = 8 ] || fail "history: expected 8 pinned file versions, found $n"
+      echo "History OK: $n pinned file versions readable (content-addressed, from the pinned pack)"
+    }
+
+    # Test tooling: the pinned Playwright and its Chromium. Node must already be on the runner image (no setup action).
+    install_playwright() {
+      local major
+      major="$(node -p 'process.versions.node.split(".")[0]')" || fail "node is not available on this runner"
+      [ "$major" -ge 20 ] && [ "$major" -le 24 ] || fail "node $major is outside the tested range 20-24"
+      npm install -g --no-audit --no-fund "playwright@$PLAYWRIGHT_VERSION" > /dev/null || fail "Playwright $PLAYWRIGHT_VERSION could not be installed"
+      [ "$(npx --no-install playwright --version)" = "Version $PLAYWRIGHT_VERSION" ] || fail "Playwright is not version $PLAYWRIGHT_VERSION"
+      npx --no-install playwright install --with-deps chromium > /dev/null || fail "Chromium could not be installed"
+      echo "Tooling: node $(node --version), Playwright $PLAYWRIGHT_VERSION with its Chromium"
+    }
+
+    # A test may never be weakened from outside: none of these switches may be set in any test step.
+    refuse_test_overrides() {
+      local v
+      for v in SKIP_MUTANTS QUICK GH_BASE GH_BASE_ENGINE GH_ENGINE GH_REPO KA_STRICT KA_LIST RG_ENGINE_SOURCE GH_CHROMIUM; do
+        [ -z "${!v:-}" ] || fail "test override $v is set: refusing to run weakened tests"
+      done
+    }
+
+jobs:
+  preflight:
+    name: Preflight (no secret)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read        # read the staging-db Environment's protection rules and the migration workflow's runs
+      pages: read          # read which commit GitHub Pages is serving
+    env:
+      EVENT: ${{ github.event_name }}
+      REPO: ${{ github.repository }}
+      GIT_REF: ${{ github.ref }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      COMMIT: ${{ github.sha }}
+      EXPECTED_TEST_REF: ${{ vars.EXPECTED_TEST_REF }}
+      POOLER_URL: ${{ vars.STAGING_POOLER_URL }}
+      CONFIRM_REF: ${{ inputs.confirm_project_ref }}
+    steps:
+      - name: Check how the run was started
+        run: |
+          printf '%s\n' "$CHECKS_SH" > "$RUNNER_TEMP/checks.sh"; . "$RUNNER_TEMP/checks.sh"
+          check_context
+          echo "Context OK: manual start, $REPO, main, first attempt."
+      - name: Check out this exact commit (read-only, no stored credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the validation files, the migration files and the staging target
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          check_context
+          verify_validation_files
+          verify_migration_files
+          verify_target
+          install_pyyaml | tee -a "$GITHUB_STEP_SUMMARY"
+          check_shared_lock | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Files and target OK: validation files and 20 migration files match their pins; every setting names $STAGING_REF only." | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check the approval gate and the Pages deployment (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          check_environment | tee -a "$GITHUB_STEP_SUMMARY"
+          check_no_migration_running | tee -a "$GITHUB_STEP_SUMMARY"
+          check_pages | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check the database's TLS certificate and hostname (no password)
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          write_ca "$RUNNER_TEMP/supabase-root-ca.pem"
+          tls_probe "$(pooler_host)" "$RUNNER_TEMP/supabase-root-ca.pem" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  repo-tests:
+    name: Fast gate and full browser regression (no secret)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    env:
+      EVENT: ${{ github.event_name }}
+      REPO: ${{ github.repository }}
+      GIT_REF: ${{ github.ref }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check out this exact commit (read-only, no stored credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify files, import the pinned history, install test tooling
+        run: |
+          printf '%s\n' "$CHECKS_SH" > "$RUNNER_TEMP/checks.sh"; . "$RUNNER_TEMP/checks.sh"
+          check_context
+          verify_validation_files
+          import_history | tee -a "$GITHUB_STEP_SUMMARY"
+          install_playwright | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Fast gate (9 steps; known-open ledger must match exactly)
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          refuse_test_overrides
+          log="$RUNNER_TEMP/fast"; mkdir -p "$log"; n=0
+          while IFS='|' read -r name cmd; do
+            n=$((n + 1)); rc=0
+            # shellcheck disable=SC2086  # cmd is a fixed command line from the list below
+            $cmd > "$log/$n.txt" 2>&1 || rc=$?
+            cat "$log/$n.txt"
+            [ "$rc" -eq 0 ] || fail "fast gate step $n ($name) failed with exit status $rc"
+            echo "- fast gate $n/9 $name: $(grep -v '^\s*$' "$log/$n.txt" | tail -1)" >> "$GITHUB_STEP_SUMMARY"
+          done <<'LIST'
+          register|node premium/tests/register-check.js
+          catalog|node catalog/check-catalog.js
+          red-green harness|node premium/tests/proof/red-green-harness.test.js
+          ackermann reference|node premium/tests/ackermann-reference.test.js
+          engine self-test|node premium/tests/engine-selftest.js
+          known-answer|node premium/tests/known-answer-critical.test.js
+          unit factors|node premium/tests/unit-factors.test.js
+          legacy fixes|node premium/tests/legacy-fixes.test.js
+          numeric guard|node premium/tests/numeric-guard.test.js
+          LIST
+          [ "$n" = 9 ] || fail "the fast gate ran $n steps, not 9"
+          grep -qF 'known-answer (Critical/High): 78 cases, 58 passed, 20 failed — 20 of the 20 known-open failures present, 0 unexpected failure(s), 0 stale ledger entries' "$log/6.txt" \
+            || fail "the known-answer suite did not report exactly 78 cases, 58 passed, the 20 known-open failures, 0 unexpected, 0 stale"
+          python3 - .github/validation/expected.json premium/tests/data/known-answer-open.json <<'PYEOF' || fail "the known-open ledger is not the recorded one"
+          import collections, json, sys
+          want = json.load(open(sys.argv[1]))["known_answer"]["known_open_by_defect"]
+          got = dict(collections.Counter(json.load(open(sys.argv[2]))["open"].values()))
+          sys.exit(0 if got == want else f"ledger by defect {got} != recorded {want}")
+          PYEOF
+      - name: Full browser regression (51 suites, mutants included, nothing skipped)
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          refuse_test_overrides
+          suites="$(sed -n 's/^for t in \(.*\); do$/\1/p' premium/tests/run-browser-tests.sh)"
+          [ "$(wc -w <<< "$suites")" = 51 ] || fail "run-browser-tests.sh does not list exactly 51 suites"
+          for t in search-authority.test.js upgrade-navigation.test.js premium-profile.test.js validation-units-imp018.test.js; do
+            grep -qw "$t" <<< "$suites" || fail "history-dependent suite $t is not in the regression list"
+          done
+          rc=0; bash premium/tests/run-browser-tests.sh > "$RUNNER_TEMP/regression.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/regression.txt"
+          [ "$rc" -eq 0 ] || fail "the full browser regression failed (exit status $rc)"
+          ran="$(grep -c '^=== ' "$RUNNER_TEMP/regression.txt" || true)"
+          [ "$ran" = 51 ] || fail "the regression ran $ran suites, not 51"
+          ! grep -qE '^(SKIPPED|SKIP:)|is not in this clone|shallow clone' "$RUNNER_TEMP/regression.txt" || fail "a suite skipped work or could not read its history"
+          python3 - "$RUNNER_TEMP/regression.txt" <<'PYEOF' || fail "a history-dependent suite has no fully passing result line"
+          import re, sys
+          log = open(sys.argv[1]).read()
+          pats = [r"^search authority \(GH-DEF-038\): (\d+)/\1 passed$", r"^upgrade navigation \(GH-DEF-039\): (\d+)/\1 passed$",
+                  r"^premium profile: (\d+)/\1 passed$", r"^GH-IMP-018 validation units: \d+ checks, 0 failures$"]
+          missing = [p for p in pats if not re.search(p, log, re.M)]
+          sys.exit(f"no fully passing result line for: {missing}" if missing else 0)
+          PYEOF
+          echo "- full browser regression: 51/51 suites passed (history-dependent suites ran with their pinned old versions)" >> "$GITHUB_STEP_SUMMARY"
+
+  site:
+    name: Live site and public web API (no secret)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      EVENT: ${{ github.event_name }}
+      REPO: ${{ github.repository }}
+      GIT_REF: ${{ github.ref }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      COMMIT: ${{ github.sha }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Check out this exact commit (read-only, no stored credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify files and install test tooling
+        run: |
+          printf '%s\n' "$CHECKS_SH" > "$RUNNER_TEMP/checks.sh"; . "$RUNNER_TEMP/checks.sh"
+          check_context
+          verify_validation_files
+          install_playwright
+      - name: A1 + A2 + A4 - every published file served byte-identical; staging project only; noindex, no Markdown
+        env:
+          SITE_URL: ${{ env.STAGING_SITE_URL }}
+          REPO_DIR: ${{ github.workspace }}
+          OUT_DIR: ${{ runner.temp }}/served
+        run: node .github/validation/site_check.mjs integrity | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: A3 - live page connects to the staging project with 0 errors
+        env:
+          SITE_URL: ${{ env.STAGING_SITE_URL }}
+        run: node .github/validation/site_check.mjs live | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: B2 - known-answer suite against the engine file AS SERVED
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          refuse_test_overrides
+          engine="$RUNNER_TEMP/served/F1_12_4_Gearhead_Labs_Automotive_Math_Encyclopedia_Universal_batch9_1.html"
+          [ -s "$engine" ] || fail "the served engine was not saved by A1"
+          rc=0; GH_ENGINE="$engine" node premium/tests/known-answer-critical.test.js > "$RUNNER_TEMP/ka-served.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/ka-served.txt"
+          [ "$rc" -eq 0 ] || fail "known-answer suite on the served engine failed (exit status $rc)"
+          grep -qF 'known-answer (Critical/High): 78 cases, 58 passed, 20 failed — 20 of the 20 known-open failures present, 0 unexpected failure(s), 0 stale ledger entries' "$RUNNER_TEMP/ka-served.txt" \
+            || fail "known-answer on the served engine differs from the recorded result"
+          echo "- B2: known-answer on the served engine: 78 cases, 58 passed, 20 known-open, 0 unexpected" >> "$GITHUB_STEP_SUMMARY"
+      - name: S3 - anonymous web-API requests (publishable key only) are all refused
+        env:
+          REPO_DIR: ${{ github.workspace }}
+          EXPECTED_JSON: .github/validation/expected.json
+        run: node .github/validation/site_check.mjs anon | tee -a "$GITHUB_STEP_SUMMARY"
+
+  database:
+    name: Database security (approval required)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: staging-db       # required reviewer = you; main only. Nothing below starts until you approve.
+    permissions:
+      contents: read
+      actions: read               # re-read the Environment's protection rules and the migration workflow's runs
+    env:
+      EVENT: ${{ github.event_name }}
+      REPO: ${{ github.repository }}
+      GIT_REF: ${{ github.ref }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      COMMIT: ${{ github.sha }}
+      EXPECTED_TEST_REF: ${{ vars.EXPECTED_TEST_REF }}
+      POOLER_URL: ${{ vars.STAGING_POOLER_URL }}
+      CONFIRM_REF: ${{ inputs.confirm_project_ref }}
+    steps:
+      - name: Check out this exact commit (read-only, no stored credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Repeat every preflight check that needs no password
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s\n' "$CHECKS_SH" > "$RUNNER_TEMP/checks.sh"; . "$RUNNER_TEMP/checks.sh"
+          check_context
+          check_environment
+          check_no_migration_running
+          verify_validation_files
+          verify_migration_files
+          verify_target
+          install_pyyaml
+          check_shared_lock
+          command -v psql > /dev/null || fail "psql is not available on this runner"
+          write_ca "$RUNNER_TEMP/supabase-root-ca.pem"
+          tls_probe "$(pooler_host)" "$RUNNER_TEMP/supabase-root-ca.pem"
+      - name: Collect database results (the ONLY step that receives the password)
+        env:
+          PGPASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          [ -n "${PGPASSWORD:-}" ] || fail "Environment secret STAGING_DB_PASSWORD is not set"
+          # Connection from libpq environment variables: the password never appears in a command line or a URL.
+          export PGHOST; PGHOST="$(pooler_host)"
+          export PGPORT=5432 PGDATABASE=postgres PGUSER="postgres.$STAGING_REF" PGCONNECT_TIMEOUT=20
+          export PGSSLMODE=verify-full PGSSLROOTCERT="$RUNNER_TEMP/supabase-root-ca.pem" PGAPPNAME=gh-staging-validation
+          [ -n "$PGHOST" ] || fail "no pooler host"
+          out="$RUNNER_TEMP/db"; mkdir -p "$out"
+          ro() { psql -X -q -A -t -v ON_ERROR_STOP=1 -c 'SET default_transaction_read_only = on' -f "$1" > "$2" || fail "read-only query $1 failed"; }
+          ro .github/validation/db-counts.sql "$out/before.json"
+          ro .github/validation/db-audit.sql  "$out/live-audit.json"
+          # The matrix: one statement, always ends in GH_TEST_SENTINEL (rolled back). Its exit status is judged later.
+          rc=0; psql -X -q -A -t -v ON_ERROR_STOP=1 -f .github/validation/db-matrix.sql > "$out/matrix.out" 2> "$out/matrix.err" || rc=$?
+          echo "$rc" > "$out/matrix.rc"
+          ro .github/validation/db-counts.sql "$out/after.json"
+          echo "Collected: counts before/after, live audit, access matrix (psql exit status $rc; the sentinel ending is required)."
+      - name: Build the replica from the migration files (no password)
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          pgbin="$(find /usr/lib/postgresql -mindepth 2 -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -1)"
+          [ -x "$pgbin/initdb" ] || fail "PostgreSQL server programs are not on this runner: the replica cannot be built"
+          [ "$(basename "$(dirname "$pgbin")")" -ge 14 ] || fail "PostgreSQL on this runner is older than 14"
+          mapfile -t versions < <(python3 -c 'import json,sys; [print(v) for v in (lambda o: o.get("counts", o))(json.loads(open(sys.argv[1]).read().strip()))["migrations"]]' "$RUNNER_TEMP/db/before.json")
+          files=(); for v in "${versions[@]}"; do f=(supabase/migrations/"$v"_*.sql); [ -f "${f[0]}" ] && [ "${#f[@]}" = 1 ] || fail "staging records migration $v, which is not one of the approved files"; files+=("${f[0]}"); done
+          case "${#files[@]}" in 19|20) ;; *) fail "staging records ${#files[@]} migrations; only 19 (0001-0409) or 20 (+0410) are valid" ;; esac
+          data="$RUNNER_TEMP/replica"; sock="$RUNNER_TEMP/replica-sock"; mkdir -p "$sock"
+          "$pgbin/initdb" -D "$data" -A trust -U supabase_admin -E UTF8 --locale=C.UTF-8 > "$RUNNER_TEMP/initdb.log" 2>&1 || fail "initdb failed"
+          "$pgbin/pg_ctl" -D "$data" -o "-c listen_addresses='' -c unix_socket_directories=$sock -c port=54399" -l "$RUNNER_TEMP/replica.log" -w start > /dev/null || fail "the replica did not start"
+          local_psql() { env -u PGHOST -u PGPORT -u PGUSER -u PGDATABASE -u PGSSLMODE -u PGSSLROOTCERT psql -h "$sock" -p 54399 -X -q -v ON_ERROR_STOP=1 "$@"; }
+          local_psql -U supabase_admin -d postgres -c 'CREATE DATABASE replica TEMPLATE template0' || fail "replica database not created"
+          local_psql -U supabase_admin -d replica -f premium-foundation/tests/sql/000_hosted_supabase_shim.sql > /dev/null || fail "replica shim failed"
+          for f in "${files[@]}"; do local_psql -U postgres -d replica -f "$f" > /dev/null || fail "replica: $f failed"; done
+          local_psql -U postgres -d replica -A -t -f .github/validation/db-audit.sql > "$RUNNER_TEMP/db/replica-audit.json" || fail "replica audit failed"
+          "$pgbin/pg_ctl" -D "$data" -m fast stop > /dev/null
+          echo "Replica built from ${#files[@]} approved migration files (PostgreSQL $(basename "$(dirname "$pgbin")"))."
+      - name: Judge the results (no password)
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          d="$RUNNER_TEMP/db"; v=.github/validation; status=0
+          python3 "$v/db_check.py" audit  "$d/live-audit.json" "$d/replica-audit.json" "$v/expected.json" | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 "$v/db_check.py" matrix "$d/matrix.err" "$(cat "$d/matrix.rc")" "$d/before.json" "$v/expected.json" | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 "$v/db_check.py" counts "$d/before.json" "$d/after.json" | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          [ "$status" = 0 ] || fail "one or more database checks failed (details above)"
+          echo "Database security: PASS. Not covered here: the Supabase security advisor (run it through the connector or dashboard)." | tee -a "$GITHUB_STEP_SUMMARY"

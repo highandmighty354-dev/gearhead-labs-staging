@@ -1,0 +1,69 @@
+{
+  "_about": "Expected results for staging-validation.yml. Every value here is checked exactly; nothing is optional. Changing this file changes its SHA-256, which is pinned in the workflow, so a change needs a reviewed workflow change too.",
+  "staging_ref": "npizzzfvbtrlpnxfhqks",
+  "exposed_tables": ["accounts","billing_customers","calculation_records","calculators","canonical_fields","component_connections","components","engineering_analyses","engineering_analyzers","entitlement_grants","formula_versions","garages","machine_details","machines","plan_offers","plan_prices","plans","profiles","saved_calculations","stripe_events","subscriptions","test_setups","value_records"],
+  "primary_keys": {"accounts":"id:uuid","billing_customers":"account_id:uuid","calculation_records":"id:uuid","calculators":"calculator_id:text","canonical_fields":"key:text","component_connections":"id:uuid","components":"id:uuid","engineering_analyses":"id:uuid","engineering_analyzers":"analyzer_id:text","entitlement_grants":"id:uuid","formula_versions":"calculator_id:text","garages":"id:uuid","machine_details":"machine_id:uuid","machines":"id:uuid","plan_offers":"plan_key:text","plan_prices":"stripe_price_id:text","plans":"plan_key:text","profiles":"account_id:uuid","saved_calculations":"id:uuid","stripe_events":"event_id:text","subscriptions":"stripe_subscription_id:text","test_setups":"id:uuid","value_records":"id:uuid"},
+  "anon_rpc_probes": [
+    ["df_soft_delete_component", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["df_soft_delete_connection", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["df_soft_delete_garage", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["df_soft_delete_machine", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["gf_repin_test_setup_baseline", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["gf_soft_delete_test_setup", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["pf_has_feature", {"p_feature": "garage"}],
+    ["pf_my_entitlement", {}],
+    ["pf_soft_delete_engineering_analysis", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["pf_soft_delete_saved_calculation", {"p_id": "00000000-0000-0000-0000-000000000000"}],
+    ["pf_grant_manual", {"p_account": "00000000-0000-0000-0000-000000000000", "p_plan": "premium", "p_ends_at": null, "p_note": "validation probe"}]
+  ],
+  "anon_rpc_not_exposed": ["df_handle_new_auth_user"],
+  "anon_function_policy": {
+    "_rule": "The anonymous role may hold EXECUTE only on these public functions, each of which must return trigger. PostgreSQL refuses a direct call to a trigger function (0A000) and the web API does not expose one; when a trigger fires, PostgreSQL does not check the caller's EXECUTE privilege, so this privilege is not what makes the triggers work. Any other anonymous-executable function, a listed one that stops returning trigger, or a listed one that is no longer anonymous-executable fails the audit.",
+    "allowed_trigger_functions": [
+      "df_calculation_validate()", "df_guard_update()", "df_handle_new_auth_user()", "df_refuse()", "df_stamp_insert()",
+      "df_value_validate()", "gf_test_setup_guard_update()", "gf_test_setup_refuse_delete()", "gf_test_setup_stamp_insert()"
+    ]
+  },
+  "customer_tables": ["accounts","profiles","garages","machines","machine_details","components","component_connections","test_setups","calculation_records","value_records","saved_calculations","engineering_analyses","entitlement_grants","subscriptions","billing_customers"],
+  "reference_tables": ["calculators","canonical_fields","formula_versions","plans","plan_offers","plan_prices","engineering_analyzers","stripe_events"],
+  "unreadable_by_signed_in": ["billing_customers","stripe_events"],
+  "seeded_rows_per_user": {"components": 2, "_default": 1},
+  "writes": {
+    "anon": {
+      "ins_garage_own": "REFUSED 42501", "ins_machine_own": "REFUSED 42501", "ins_garage_as_other": "REFUSED 42501",
+      "upd_other_garage": "REFUSED 42501", "give_own_garage_away": "REFUSED 42501", "del_own_garage": "REFUSED 42501",
+      "del_other_garage": "REFUSED 42501", "upd_other_machine": "REFUSED 42501", "upd_other_setup": "REFUSED 42501",
+      "upd_other_profile": "REFUSED 42501", "softdel_other_garage_rpc": "REFUSED 42501", "ins_calc_record": "REFUSED 42501",
+      "ins_formula_version": "REFUSED 42501", "upd_formula_version": "REFUSED 42501", "ins_entitlement": "REFUSED 42501",
+      "ins_saved_own_calc": "REFUSED 42501", "ins_saved_other_calc": "REFUSED 42501", "ins_value_record": "REFUSED 42501",
+      "rpc_handle_new_user": "REFUSED 0A000"
+    },
+    "premium": {
+      "ins_garage_own": "REFUSED 23505", "ins_machine_own": "OK rows=1", "ins_garage_as_other": "REFUSED 42501",
+      "upd_other_garage": "OK rows=0", "give_own_garage_away": "REFUSED 42501", "del_own_garage": "REFUSED 42501",
+      "del_other_garage": "REFUSED 42501", "upd_other_machine": "OK rows=0", "upd_other_setup": "OK rows=0",
+      "upd_other_profile": "OK rows=0", "softdel_other_garage_rpc": "REFUSED P0002", "ins_calc_record": "REFUSED 42501",
+      "ins_formula_version": "REFUSED 42501", "upd_formula_version": "REFUSED 42501", "ins_entitlement": "REFUSED 42501",
+      "ins_saved_own_calc": "OK rows=1", "ins_saved_other_calc": "REFUSED 23503", "ins_value_record": "REFUSED 42501",
+      "rpc_handle_new_user": "REFUSED 0A000"
+    },
+    "free": {
+      "ins_garage_own": "REFUSED 42501", "ins_machine_own": "REFUSED 42501", "ins_garage_as_other": "REFUSED 42501",
+      "upd_other_garage": "OK rows=0", "give_own_garage_away": "REFUSED 42501", "del_own_garage": "REFUSED 42501",
+      "del_other_garage": "REFUSED 42501", "upd_other_machine": "OK rows=0", "upd_other_setup": "OK rows=0",
+      "upd_other_profile": "OK rows=0", "softdel_other_garage_rpc": "REFUSED P0002", "ins_calc_record": "REFUSED 42501",
+      "ins_formula_version": "REFUSED 42501", "upd_formula_version": "REFUSED 42501", "ins_entitlement": "REFUSED 42501",
+      "ins_saved_own_calc": "REFUSED 42501", "ins_saved_other_calc": "REFUSED 42501", "ins_value_record": "REFUSED 42501",
+      "rpc_handle_new_user": "REFUSED 0A000"
+    }
+  },
+  "migration_0410": {
+    "version": "0410",
+    "new_fingerprints": {"diesel_power_from_fuel": "fv1-b16d2d94", "diesel_smoke_limit": "fv1-64771dd0", "piston_position": "fv1-09188b84", "cranking_compression": "fv1-59c91f10", "wet_bulb": "fv1-782fda42", "rc_fuel_stint": "fv1-6d100b74"},
+    "formula_versions_without": 582,
+    "formula_versions_with": 588
+  },
+  "known_answer": {"cases": 78, "passed": 58, "known_open": 20, "known_open_by_defect": {"GH-DEF-049": 2, "GH-DEF-051": 3, "GH-DEF-052": 1, "GH-DEF-056": 1, "GH-DEF-058": 9, "GH-DEF-059": 4}},
+  "browser_suites": 51,
+  "fast_gate_steps": 9
+}
