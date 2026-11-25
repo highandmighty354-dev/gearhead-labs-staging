@@ -49,14 +49,22 @@ async function get(url) {
   return { status: r.status, body: Buffer.from(await r.arrayBuffer()) };
 }
 
-// The staging site and nothing else. Production is served from the same github.io host under another path, so the path
-// must be exactly /gearhead-labs-staging/ and carry no query or fragment; anything else stops before a request is sent.
+// The staging site and nothing else. SITE_URL must be exactly this address: HTTPS, this host (no port, no credentials),
+// this path, no query and no fragment. Production is served from the same host under another path, and any other host is
+// refused even with the same path. Anything else stops before a single request is sent.
+const STAGING_SITE = 'https://highandmighty354-dev.github.io/gearhead-labs-staging/';
 function stagingSite() {
   const s = env('SITE_URL');
-  if (!s.endsWith('/')) die('SITE_URL must end with /');
   let u;
   try { u = new URL(s); } catch (e) { die(`SITE_URL ${s} is not a valid address`); }
-  if (u.pathname !== '/gearhead-labs-staging/' || u.search || u.hash) die(`SITE_URL ${s} is not the staging site (its path must be exactly /gearhead-labs-staging/)`);
+  const why = [];
+  if (u.protocol !== 'https:') why.push(`protocol is ${u.protocol}, not https:`);
+  if (u.hostname !== 'highandmighty354-dev.github.io' || u.port !== '') why.push(`host is ${u.host}, not highandmighty354-dev.github.io`);
+  if (u.username || u.password) why.push('it carries credentials');
+  if (u.pathname !== '/gearhead-labs-staging/') why.push(`path is ${u.pathname}, not /gearhead-labs-staging/`);
+  if (u.search || u.hash || s.includes('?') || s.includes('#')) why.push('it has a query or fragment');
+  if (s !== STAGING_SITE && !why.length) why.push(`it is not written exactly as ${STAGING_SITE}`);
+  if (why.length) die(`SITE_URL ${s} is not the staging site: ${why.join('; ')}`);
   return s;
 }
 

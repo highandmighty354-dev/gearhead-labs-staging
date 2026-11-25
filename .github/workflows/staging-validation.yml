@@ -1,8 +1,11 @@
-# Gearhead Labs STAGING - hosted validation of PR #31 (checks S1-S4 of the staging plan)
+# Gearhead Labs STAGING - hosted validation of the staging site and staging database (checks S1-S4 of the staging plan)
 # File: .github/workflows/staging-validation.yml in highandmighty354-dev/gearhead-labs-staging ONLY.
 #
-# PROPOSAL FOR OWNER REVIEW, draft 1 (2026-11-24). NOT committed, NOT run. Needs the files in .github/validation/
-# (hash-pinned below) committed with it, GitHub Pages turned on, and the owner's approval of each run.
+# Validation package Draft 3 (package SHA-256 31c1b1c90b580110f5396ad34ec8b640d0e814c527b02d80582cb738d992b027),
+# committed to this repository through PR #1, plus two owner-approved corrections made in PR #1 after Draft 3: this header,
+# and a stricter staging-address guard in .github/validation/site_check.mjs (re-pinned below).
+# Runs only when started by hand from main, after PR #1 is merged and GitHub Pages is turned on, and its database job
+# waits for the owner's approval on every run. Its files in .github/validation/ are hash-pinned below.
 #
 # What it checks, all against the ONE staging project pinned below:
 #   preflight   (no secret)                 how the run started, the typed project ref, the pinned staging target, the 20
@@ -10,9 +13,10 @@
 #                                           THIS commit, and the database's TLS certificate (no password)
 #   repo-tests  (no secret)                 fast gate (9 steps) and the full browser regression (51 suites), including the
 #                                           4 suites that need old file versions, which come from a hash-pinned history pack
-#   site        (no secret)                 A1 served files = this commit; A2 served config = staging only; A3 the live page
-#                                           connects to staging with 0 errors; B2 known-answer suite on the SERVED engine;
-#                                           S3 anonymous web-API requests are all refused
+#   site        (no secret)                 A1 served files = this commit; A2 served config = staging only; A4 every page
+#                                           noindex and no Markdown published; A3 the live page connects to staging with
+#                                           0 errors; B2 known-answer suite on the SERVED engine; S3 anonymous web-API
+#                                           requests are all refused
 #   database    (Environment staging-db)    WAITS FOR YOUR APPROVAL. Protection audit against a replica built from the
 #                                           migration files, two-user access matrix in a transaction that cannot commit,
 #                                           formula-version checks, before/after counts. Only ONE step gets the password.
@@ -71,7 +75,7 @@ env:
     a41a92515343feeea31154669d7a2f72e203e653330250bc03058b7938fbccbd  .github/validation/expected.json
     4afcaeb10be548c4e604d38e89a50fef36bab2b3c258cc463f082df0d12a170e  .github/validation/history.pack
     cea04901f64e959ee70a8d4e40e32dd545d6e54d1a047ab3f3ff91464d311d51  .github/validation/history.txt
-    0961ed8b5064b38d484da40ac6d1e3fe25fd89e424cfff39ab612a2c71fe7ce3  .github/validation/site_check.mjs
+    0e8cab0d423a80bbf38509459c33ff3f0a8a8ec245e08f70991ae053ec6ebc6e  .github/validation/site_check.mjs
     68596434d3238152aac665618b5b013812bba0494933f6c59d1c94869e9437cd  premium-foundation/tests/sql/000_hosted_supabase_shim.sql
   # Supabase's two root CAs (from github.com/supabase/cli tag v2.119.0), identical to staging-migrations.yml.
   SUPABASE_ROOT_CA_SHA256_FINGERPRINTS: "5F9B77951A7AA1303F9B58EEA9BFA89E358CFDC15F9786FF10D4930A722C9AE2 807025AD50D4ED219D2C9C7D299C004F824EB00CF7F65AFEF607D07B72E6CAFA"
