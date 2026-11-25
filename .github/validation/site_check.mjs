@@ -2,7 +2,9 @@
 // the only key involved is the publishable key that the website itself serves to every visitor.
 //
 //   node site_check.mjs integrity   A1 every published file served byte-identical to this commit; A2 served config names the
-//                                   staging project only, and no served code names any other Supabase project or a secret key
+//                                   staging project only, and no served code names any other Supabase project or a secret key;
+//                                   A4 every published HTML page carries exactly one robots directive, "noindex", and every
+//                                   Markdown file is kept off the site (_config.yml lists exactly them; each answers 404)
 //   node site_check.mjs live        A3 the live page boots, connects to the staging project only, with 0 page errors
 //   node site_check.mjs anon        S3 with only the publishable key: every table read/insert/update/delete and every callable
 //                                   function is refused; trigger functions are not exposed at all
@@ -47,8 +49,62 @@ async function get(url) {
   return { status: r.status, body: Buffer.from(await r.arrayBuffer()) };
 }
 
-// GitHub Pages publishes the branch through Jekyll: paths with a dot-folder or dot-file segment are not published and
-// Markdown is rendered to HTML. Everything else must be served byte-for-byte. Nothing else is excluded.
+// The staging site and nothing else. Production is served from the same github.io host under another path, so the path
+// must be exactly /gearhead-labs-staging/ and carry no query or fragment; anything else stops before a request is sent.
+function stagingSite() {
+  const s = env('SITE_URL');
+  if (!s.endsWith('/')) die('SITE_URL must end with /');
+  let u;
+  try { u = new URL(s); } catch (e) { die(`SITE_URL ${s} is not a valid address`); }
+  if (u.pathname !== '/gearhead-labs-staging/' || u.search || u.hash) die(`SITE_URL ${s} is not the staging site (its path must be exactly /gearhead-labs-staging/)`);
+  return s;
+}
+
+// A4: the robots directives a crawler would read from a page. Every <meta> named "robots" or naming a crawler ("...bot",
+// e.g. googlebot, bingbot) is counted, wherever it sits. A page passes only with exactly one such tag, inside <head>,
+// named "robots", whose content is exactly "noindex"; a second or crawler-specific tag could re-allow indexing.
+function robotsProblems(html) {
+  const attr = (tag, a) => {
+    const m = new RegExp(`\\s${a}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, 'i').exec(tag);
+    return m ? (m[1] ?? m[2] ?? m[3]) : null;
+  };
+  const isRobots = (tag) => /^(robots|[a-z0-9_-]*bot[a-z0-9_-]*)$/i.test((attr(tag, 'name') || '').trim());
+  const head = /<head(?:\s[^>]*)?>([\s\S]*?)<\/head\s*>/i.exec(html);
+  if (!head) return ['no <head> element'];
+  const all = [...html.matchAll(/<meta\b[^>]*>/gi)].map((m) => m[0]).filter(isRobots);
+  const inHead = [...head[1].matchAll(/<meta\b[^>]*>/gi)].map((m) => m[0]).filter(isRobots);
+  if (all.length === 0) return ['no robots meta tag'];
+  const out = [];
+  if (all.length !== 1) out.push(`${all.length} robots-type meta tags (${all.map((t) => attr(t, 'name')).join(', ')}), not exactly 1`);
+  if (inHead.length !== all.length) out.push(`${all.length - inHead.length} robots-type meta tag(s) outside <head>`);
+  for (const t of all) {
+    const name = (attr(t, 'name') || '').trim(), content = (attr(t, 'content') || '').replace(/\s+/g, '').toLowerCase();
+    if (name.toLowerCase() !== 'robots') out.push(`crawler-specific tag name="${name}"`);
+    if (content !== 'noindex') out.push(`name="${name}" content="${attr(t, 'content')}", not "noindex"`);
+  }
+  return out;
+}
+
+// A4: the exclusions in _config.yml, read strictly. Only comments, blank lines, one "exclude:" key and its list of quoted
+// paths are allowed, so the file cannot quietly change anything else about how Pages builds the site.
+function configExcludes(repoDir) {
+  const p = path.join(repoDir, '_config.yml');
+  if (!fs.existsSync(p)) return { error: '_config.yml is missing' };
+  const items = [];
+  let key = false;
+  for (const [i, line] of fs.readFileSync(p, 'utf8').split('\n').entries()) {
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    if (line === 'exclude:' && !key) { key = true; continue; }
+    const m = /^  - "([^"\\]+)"$/.exec(line);
+    if (key && m) { items.push(m[1]); continue; }
+    return { error: `_config.yml line ${i + 1} is not a comment, the single "exclude:" key or a quoted list entry: ${JSON.stringify(line)}` };
+  }
+  if (!key) return { error: '_config.yml has no "exclude:" list' };
+  return { items };
+}
+
+// GitHub Pages publishes the branch through Jekyll: paths with a dot-folder or dot-file segment are not published, and
+// Markdown is kept off the site by _config.yml (A4). Everything else must be served byte-for-byte. Nothing else is excluded.
 function publishedFiles(repoDir) {
   const all = execFileSync('git', ['-C', repoDir, 'ls-files', '-z'], { maxBuffer: 1 << 26 }).toString().split('\0').filter(Boolean);
   const dot = (p) => p.split('/').some((s) => s.startsWith('.') || s.startsWith('_'));
@@ -57,13 +113,14 @@ function publishedFiles(repoDir) {
 }
 
 async function integrity() {
-  const SITE = env('SITE_URL'), REPO = env('REPO_DIR'), OUT = env('OUT_DIR'), RUN = env('RUN_ID');
-  if (!SITE.endsWith('/')) die('SITE_URL must end with /');
+  const SITE = stagingSite(), REPO = env('REPO_DIR'), OUT = env('OUT_DIR'), RUN = env('RUN_ID');
   publishableKey(REPO);
   const { published, skippedDot, skippedMd } = publishedFiles(REPO);
   if (published.length < 100) die(`only ${published.length} published files found: wrong checkout?`);
+  const htmlPages = published.filter((p) => /\.html?$/i.test(p));
+  if (!htmlPages.includes('index.html')) die('index.html is not among the published files: wrong checkout?');
   fs.mkdirSync(OUT, { recursive: true });
-  let same = 0;
+  let same = 0, noindexOk = 0;
   for (const rel of published) {
     const url = SITE + rel.split('/').map(encodeURIComponent).join('/') + `?gh_validation=${RUN}`;
     let r;
@@ -78,19 +135,52 @@ async function integrity() {
       for (const ref of refs) if (ref !== STAGING_REF) bad(`${rel}: names Supabase project ${ref}, which is not the staging project`);
       if (SECRET_RE.test(text)) bad(`${rel}: holds something that looks like a secret key`);
     }
+    if (/\.html?$/i.test(rel)) {   // A4 on the bytes actually served (already proven identical to this commit)
+      const issues = robotsProblems(r.body.toString('utf8'));
+      if (issues.length) for (const m of issues) bad(`A4: ${rel}: ${m}`); else noindexOk++;
+    }
     if (rel.startsWith('F1_12_4_') && rel.endsWith('.html')) fs.writeFileSync(path.join(OUT, rel), r.body);   // engine for B2
   }
   console.log(`A1: ${same} of ${published.length} published files served byte-identical; not published by design: ` +
-              `${skippedDot.length} dot-path file(s), ${skippedMd.length} Markdown file(s) (rendered to HTML by Pages)`);
+              `${skippedDot.length} dot-path file(s), ${skippedMd.length} Markdown file(s) (excluded by _config.yml; see A4)`);
+  // A4: every published HTML page was served and carries the noindex directive. A page that could not be fetched, or was
+  // served with other bytes, was not checked and counts as a failure here as well as in A1.
+  if (noindexOk !== htmlPages.length) bad(`A4: ${htmlPages.length - noindexOk} of ${htmlPages.length} published HTML page(s) not confirmed noindex`);
+  // A4: Markdown is kept off the site. _config.yml must list exactly the Markdown files, and for each one the raw file, the
+  // page Jekyll would render from it, and that page's extension-less address must all answer exactly 404. Any other status,
+  // a redirect or a failed request is a failure.
+  const cfgEx = configExcludes(REPO);
+  if (cfgEx.error) bad(`A4: ${cfgEx.error}`);
+  else {
+    const want = [...skippedMd].sort(), got = [...cfgEx.items].sort();
+    const missing = want.filter((p) => !got.includes(p)), extra = got.filter((p) => !want.includes(p));
+    if (new Set(got).size !== got.length) bad('A4: _config.yml lists a path more than once');
+    if (missing.length) bad(`A4: _config.yml does not exclude ${missing.length} Markdown file(s): ${missing.join(', ')}`);
+    if (extra.length) bad(`A4: _config.yml excludes ${extra.length} path(s) that are not tracked Markdown files: ${extra.join(', ')}`);
+  }
+  let gone = 0, probes = 0;
+  for (const rel of skippedMd) {
+    const base = rel.replace(/\.(md|markdown)$/i, '');
+    for (const variant of [rel, `${base}.html`, base]) {
+      probes++;
+      const url = SITE + variant.split('/').map(encodeURIComponent).join('/') + `?gh_validation=${RUN}`;
+      let r;
+      try { r = await get(url); } catch (e) { bad(`A4: ${variant} (from ${rel}): request failed or was redirected (${e.message})`); continue; }
+      if (r.status === 404) gone++;
+      else bad(`A4: ${variant} (from ${rel}) answered HTTP ${r.status}, not 404${r.status < 300 ? ': it is published' : ''}`);
+    }
+  }
+  console.log(`A4: ${noindexOk} of ${htmlPages.length} published HTML page(s) carry exactly one robots directive, "noindex"; ` +
+              `${skippedMd.length} Markdown file(s) excluded by _config.yml, ${gone} of ${probes} address(es) answer 404`);
   const cfg = await get(SITE + 'supabase-config.js?gh_validation=' + RUN);
   const served = cfg.status === 200 ? [...cfg.body.toString('utf8').matchAll(/https:\/\/([a-z0-9]{20})\.supabase\.co/g)].map((m) => m[1]) : [];
   if (served.length !== 1 || served[0] !== STAGING_REF) bad(`A2: served supabase-config.js names ${JSON.stringify(served)}, not exactly ${STAGING_REF}`);
   else console.log(`A2: served supabase-config.js names only ${API}`);
-  finish('deployment integrity (A1, A2)');
+  finish('deployment integrity (A1, A2, A4)');
 }
 
 async function live() {
-  const SITE = env('SITE_URL'), RUN = env('RUN_ID');
+  const SITE = stagingSite(), RUN = env('RUN_ID');
   let playwright;
   try { playwright = await import('playwright'); } catch (e) {
     const root = execFileSync('npm', ['root', '-g']).toString().trim();

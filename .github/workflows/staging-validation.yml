@@ -63,7 +63,7 @@ env:
   # SHA-256 of every file this workflow executes or trusts that is not the application itself. A change to any of them
   # needs a matching, reviewed change to this list, or every job stops.
   VALIDATION_FILES_SHA256: |
-    9aaa592e32b037d14d0a0a9ae4ae5dbaec31f954050d7216e9fc56201f7301b1  .github/validation/README.md
+    6bc2d5cd0d0cc5d2c76d42a3ce9d9ac2760f9f6fdd8aff316c1c221fbfc00244  .github/validation/README.md
     aa6ebc10f1c1050d2c83ec395fccc4213d07dec1edc1999e906c72fdac8224c3  .github/validation/db-audit.sql
     acaf04f285392357a06eb9d6a0a8cb7bb09cc47f34c28e7045405009c0571733  .github/validation/db-counts.sql
     1c790e82e33b806605639cab24bd464f02571e777a5b0f9a31e800a5f5d119c5  .github/validation/db-matrix.sql
@@ -71,7 +71,7 @@ env:
     a41a92515343feeea31154669d7a2f72e203e653330250bc03058b7938fbccbd  .github/validation/expected.json
     4afcaeb10be548c4e604d38e89a50fef36bab2b3c258cc463f082df0d12a170e  .github/validation/history.pack
     cea04901f64e959ee70a8d4e40e32dd545d6e54d1a047ab3f3ff91464d311d51  .github/validation/history.txt
-    64cecd46dad346e7e19194b893d71d1e486d7ec030a9fe5516083d843d0453a3  .github/validation/site_check.mjs
+    0961ed8b5064b38d484da40ac6d1e3fe25fd89e424cfff39ab612a2c71fe7ce3  .github/validation/site_check.mjs
     68596434d3238152aac665618b5b013812bba0494933f6c59d1c94869e9437cd  premium-foundation/tests/sql/000_hosted_supabase_shim.sql
   # Supabase's two root CAs (from github.com/supabase/cli tag v2.119.0), identical to staging-migrations.yml.
   SUPABASE_ROOT_CA_SHA256_FINGERPRINTS: "5F9B77951A7AA1303F9B58EEA9BFA89E358CFDC15F9786FF10D4930A722C9AE2 807025AD50D4ED219D2C9C7D299C004F824EB00CF7F65AFEF607D07B72E6CAFA"
@@ -540,7 +540,7 @@ jobs:
           check_context
           verify_validation_files
           install_playwright
-      - name: A1 + A2 - every published file served byte-identical; staging project only
+      - name: A1 + A2 + A4 - every published file served byte-identical; staging project only; noindex, no Markdown
         env:
           SITE_URL: ${{ env.STAGING_SITE_URL }}
           REPO_DIR: ${{ github.workspace }}

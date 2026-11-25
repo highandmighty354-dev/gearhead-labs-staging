@@ -7,7 +7,7 @@ the workflow's `VALIDATION_FILES_SHA256` list stops every job.
 | --- | --- | --- |
 | `history.pack` | repo-tests | Git objects for 8 old file versions (6 old commits) that four regression suites test against as "mutants": search-authority, upgrade-navigation, premium-profile, validation-units-imp018. 22 objects, about 2.4 MB, no secrets. Imported into the job's own clone only. |
 | `history.txt` | repo-tests | `revision commit path blob` for each of the 8 versions; the workflow checks every one resolves to its pinned blob. |
-| `site_check.mjs` | site | A1/A2 deployment integrity, A3 live connection, S3 anonymous web-API probes. Publishable key only. |
+| `site_check.mjs` | site | A1/A2 deployment integrity, A4 indexing protection (noindex on every page, Markdown kept off the site), A3 live connection, S3 anonymous web-API probes. Staging site address only; publishable key only. |
 | `db-counts.sql` | database | Read-only counts and migration history, before and after. |
 | `db-audit.sql` | database | Read-only protection audit, run on staging and on a replica built from the migration files. |
 | `db-matrix.sql` | database | Two-user access matrix and formula-version checks in ONE transaction that always ends in a deliberate error (rolled back). |
