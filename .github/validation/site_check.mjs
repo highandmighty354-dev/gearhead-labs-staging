@@ -197,13 +197,36 @@ async function live() {
   const browser = await playwright.chromium.launch();
   const page = await browser.newPage();
   const pageErrors = [], consoleErrors = [], hosts = new Set();
+  // A3's single exception. The app's signed-out startup probe (premium/adapters/foundation.js, probe()) reads plans with
+  // no session; the staging project refuses it (migrations 0004/0402 give the anonymous role no table privileges) and
+  // Chromium logs the refused load as a console error. That console error is accepted only when the network shows exactly
+  // one request to this exact address, made with GET, answered HTTP 401 with exactly the body below. Every other Supabase
+  // answer of 400 or above, every failed Supabase request, a repeated probe and any other console error still fail.
+  const PROBE_URL = `${API}/rest/v1/plans?select=plan_key&limit=1`;
+  const PROBE_REFUSAL = { code: '42501', details: null, message: 'permission denied for table plans',
+                          hint: 'Grant the required privileges to the current role with: GRANT SELECT ON public.plans TO anon;' };
+  const isSupabase = (u) => { try { const h = new URL(u).hostname; return h.endsWith('.supabase.co') || h.endsWith('.supabase.in'); } catch (e) { return false; } };
+  const probeRequests = [], supabaseAnswers = [], supabaseFailures = [];
+  let probeConsole = 0;
   let connected = false;
   page.on('pageerror', (e) => pageErrors.push(String(e && e.message || e)));
   page.on('console', (m) => {
-    if (m.type() === 'error') consoleErrors.push(m.text());
+    if (m.type() === 'error') {
+      if (/^Failed to load resource: the server responded with a status of 401 \([^)]*\)$/.test(m.text()) && m.location().url === PROBE_URL) probeConsole++;
+      else consoleErrors.push(m.text());
+    }
     if (m.text().includes('Gearhead Labs: Supabase connected.')) connected = true;
   });
-  page.on('request', (q) => { try { const h = new URL(q.url()).hostname; if (h.endsWith('.supabase.co') || h.endsWith('.supabase.in')) hosts.add(h); } catch (e) { /* ignore */ } });
+  page.on('request', (q) => {
+    if (isSupabase(q.url())) hosts.add(new URL(q.url()).hostname);
+    if (q.url() === PROBE_URL && q.method() !== 'OPTIONS') probeRequests.push(q.method());   // not the browser's CORS preflight
+  });
+  page.on('response', (r) => {
+    if (!isSupabase(r.url()) || r.request().method() === 'OPTIONS') return;   // CORS preflights are checked through the request they precede
+    const a = { url: r.url(), method: r.request().method(), status: r.status() };
+    supabaseAnswers.push(r.text().then((body) => ({ ...a, body }), (e) => ({ ...a, body: null, bodyError: String(e) })));
+  });
+  page.on('requestfailed', (q) => { if (isSupabase(q.url())) supabaseFailures.push(`${q.method()} ${q.url()}: ${q.failure() && q.failure().errorText}`); });
   const resp = await page.goto(SITE + `?gh_validation=${RUN}`, { waitUntil: 'load', timeout: 60000 });
   if (!resp || resp.status() !== 200) bad(`A3: the staging page answered HTTP ${resp && resp.status()}`);
   const t0 = Date.now();
@@ -216,7 +239,19 @@ async function live() {
   if (!hosts.has(`${STAGING_REF}.supabase.co`)) bad('A3: the page never contacted the staging project');
   for (const e of pageErrors) bad(`A3: page error: ${e}`);
   for (const e of consoleErrors) bad(`A3: console error: ${e}`);
-  console.log(`A3: connected=${connected}, client ${clientUrl}, Supabase hosts contacted ${JSON.stringify([...hosts])}, page errors ${pageErrors.length}, console errors ${consoleErrors.length}`);
+  const answers = await Promise.all(supabaseAnswers);
+  const sameBody = (text) => { try { const b = JSON.parse(text); return JSON.stringify(Object.entries(b).sort()) === JSON.stringify(Object.entries(PROBE_REFUSAL).sort()); } catch (e) { return false; } };
+  const isRefusal = (a) => a.url === PROBE_URL && a.method === 'GET' && a.status === 401 && sameBody(a.body);
+  const probeAnswers = answers.filter((a) => a.url === PROBE_URL);
+  for (const f of supabaseFailures) bad(`A3: a Supabase request failed: ${f}`);
+  for (const a of answers) if (a.url !== PROBE_URL && a.status >= 400) bad(`A3: unexpected Supabase answer: ${a.method} ${a.url} -> HTTP ${a.status} ${a.body}`);
+  if (probeRequests.length > 1 || probeAnswers.length > 1) bad(`A3: the plans probe was sent ${probeRequests.length} times (${probeAnswers.length} answers), not at most once`);
+  for (const a of probeAnswers) if (a.status >= 400 && !isRefusal(a)) bad(`A3: the plans probe got an unexpected answer: ${a.method} HTTP ${a.status} ${a.body}`);
+  if (probeConsole && !(probeConsole === 1 && probeRequests.length === 1 && probeAnswers.length === 1 && isRefusal(probeAnswers[0])))
+    bad(`A3: ${probeConsole} console error(s) for the plans probe are not matched by exactly one GET answered 401 with the expected refusal`);
+  console.log(`A3: connected=${connected}, client ${clientUrl}, Supabase hosts contacted ${JSON.stringify([...hosts])}, page errors ${pageErrors.length}, ` +
+              `console errors ${consoleErrors.length}, Supabase answers ${answers.length} (${answers.map((a) => `${a.method} ${a.status}`).join(', ')}), ` +
+              `accepted probe refusals ${probeConsole}`);
   await browser.close();
   finish('live page (A3)');
 }

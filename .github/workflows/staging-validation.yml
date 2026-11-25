@@ -75,7 +75,7 @@ env:
     a41a92515343feeea31154669d7a2f72e203e653330250bc03058b7938fbccbd  .github/validation/expected.json
     4afcaeb10be548c4e604d38e89a50fef36bab2b3c258cc463f082df0d12a170e  .github/validation/history.pack
     cea04901f64e959ee70a8d4e40e32dd545d6e54d1a047ab3f3ff91464d311d51  .github/validation/history.txt
-    0e8cab0d423a80bbf38509459c33ff3f0a8a8ec245e08f70991ae053ec6ebc6e  .github/validation/site_check.mjs
+    98e2b444ae5f685e3e112e542eb9de52aea42d0d3e9e6ee5e129b07fa82b32d9  .github/validation/site_check.mjs
     68596434d3238152aac665618b5b013812bba0494933f6c59d1c94869e9437cd  premium-foundation/tests/sql/000_hosted_supabase_shim.sql
   # Supabase's two root CAs (from github.com/supabase/cli tag v2.119.0), identical to staging-migrations.yml.
   SUPABASE_ROOT_CA_SHA256_FINGERPRINTS: "5F9B77951A7AA1303F9B58EEA9BFA89E358CFDC15F9786FF10D4930A722C9AE2 807025AD50D4ED219D2C9C7D299C004F824EB00CF7F65AFEF607D07B72E6CAFA"
@@ -493,6 +493,21 @@ jobs:
           got = dict(collections.Counter(json.load(open(sys.argv[2]))["open"].values()))
           sys.exit(0 if got == want else f"ledger by defect {got} != recorded {want}")
           PYEOF
+      # browser-smoke.js A1 and H1 test an anonymous visitor with Supabase UNREACHABLE: their "offline" requests go to the
+      # real network (route.continue), which the tests' original environment blocks. This runner can reach the live
+      # staging project, which answers, so the app correctly reports "production" there. Making only the staging host
+      # unreachable in this job restores the condition those tests assert, without touching any test file. Every other
+      # suite has already passed both with this host reachable and unreachable.
+      - name: Make the staging Supabase host unreachable for the browser regression (this job only)
+        run: |
+          . "$RUNNER_TEMP/checks.sh"
+          host="$STAGING_REF.supabase.co"
+          printf '127.0.0.1 %s\n::1 %s\n' "$host" "$host" | sudo tee -a /etc/hosts > /dev/null
+          addrs="$(getent ahosts "$host" | awk '{print $1}' | sort -u | tr '\n' ' ')" || addrs="(does not resolve) "
+          [ "$addrs" = "127.0.0.1 " ] || [ "$addrs" = "127.0.0.1 ::1 " ] || [ "$addrs" = "::1 127.0.0.1 " ] || fail "$host resolves to '$addrs', not only to this machine"
+          rc=0; curl -s -o /dev/null --max-time 10 "https://$host/rest/v1/" || rc=$?
+          [ "$rc" = 7 ] || fail "$host is not refused here (curl exit status $rc, expected 7: connection refused)"
+          echo "- staging Supabase host made unreachable for this job only ($host -> this machine, connection refused)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Full browser regression (51 suites, mutants included, nothing skipped)
         run: |
           . "$RUNNER_TEMP/checks.sh"
