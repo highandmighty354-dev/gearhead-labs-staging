@@ -1156,6 +1156,10 @@ def suite_p3(ctx):
            "session_a_lock_granted_seen": a_granted, "hold_outcome": hold["outcome"],
            "a_total_hold_s": round(t_marks["released"] - t0, 3),
            "a_total_hold_under_3s": t_marks["released"] - t0 < LOCK_TIMEOUT_S,
+           # How long Session A held the analytics lock: acquired inside analytics_rollup (between the call and its return),
+           # released by COMMIT (between sending it and its return). These are the bounds of "the hold" in Revision 10.
+           "session_a_lock_hold_s": {"lower_bound": round(t_marks["commit"] - t_marks["rollup_returned"], 3),
+                                     "upper_bound": round(t_marks["released"] - t_marks["rollup_call"], 3)},
            "http": {k2: rec.get(k2) for k2 in ("status", "error", "ms_to_response")},
            "l1_rows": l1_rows, "stats_delta_test": delta_t, "other_env_changed": other_env,
            "timeline_ms": {k2: round((v - t0) * 1000, 1) for k2, v in t_marks.items()},
@@ -1195,7 +1199,10 @@ def suite_p3(ctx):
             ev.limitation("P3: PostgreSQL did not expose enough (query text not visible to this user) to identify the waiting "
                           "session as the ingest; a lock wait is NOT inferred from HTTP timing.")
             verdict = "INCONCLUSIVE"
-        res["rule_wait_ge_hold_and_lt_3s"] = upper is not None and lower >= HOLD_S and upper < LOCK_TIMEOUT_S
+        res["wait_ge_specified_1_5s"] = lower >= HOLD_S          # recorded fact only; not Revision 10's comparison
+        res["rule_wait_lt_3s"] = upper is not None and upper < LOCK_TIMEOUT_S
+        res["rule_wait_ge_session_a_hold"] = p3_wait_vs_hold(lower, upper, t_marks["commit"] - t_marks["rollup_returned"],
+                                                             t_marks["released"] - t_marks["rollup_call"])
     l1_id = l1_rows[0]["id"] if len(l1_rows) == 1 else None
     res["l1_id_above_watermark"] = (l1_id is not None and wm is not None and l1_id > int(wm))
     ev.step("database_write", session="main", statement="SELECT public.analytics_rollup_pending")
@@ -1205,9 +1212,11 @@ def suite_p3(ctx):
     res["next_run_reopened_today"] = (int(n_days) >= 1 and l1_id is not None and wm_after is not None and int(wm_after) >= l1_id)
     res["consistency"] = consistency(db, today)
     ev.doc["results"] = {"P3": res}
-    ev.limitation("P3 timing: the 1.5 s hold is counted from the first pg_locks sample showing the ingest waiting on A's lock; "
-                  "A commits only after a sample at least 1.5 s later still shows both. Wait bounds come from pg_locks sample "
-                  "times; their precision is the sampling interval plus one monitor query.")
+    ev.limitation("P3 timing: A commits only after a pg_locks sample at least 1.5 s after the ingest was first seen waiting "
+                  "still shows both. Wait bounds come from pg_locks sample times. Revision 10's rule 'the ingest's wait >= the "
+                  "hold' is compared with Session A's measured lock hold: the ingest can only begin waiting after A holds the "
+                  "lock and stops when A commits, so its wait is shorter than A's hold and the rule cannot be met literally "
+                  "(owner decision; reported as UNRESOLVED, never PASS).")
     for c in (sess_a, mon):
         try:
             c.conn.close()
@@ -1215,10 +1224,33 @@ def suite_p3(ctx):
             pass
     if verdict:
         return verdict
-    ok = (res["rule_wait_ge_hold_and_lt_3s"] and res["pg_locks_snapshot_shows_a_and_ingest"] and res["a_total_hold_under_3s"]
-          and hold["outcome"] == "held" and res["l1_id_above_watermark"] and res["next_run_reopened_today"]
-          and res["consistency"]["ok"] and a_granted and rec.get("status") == 204 and delta_t == {"accepted": 1})
-    return "PASS" if ok else "FAIL"
+    others_ok = (res["rule_wait_lt_3s"] and res["pg_locks_snapshot_shows_a_and_ingest"] and res["a_total_hold_under_3s"]
+                 and hold["outcome"] == "held" and res["l1_id_above_watermark"] and res["next_run_reopened_today"]
+                 and res["consistency"]["ok"] and a_granted and rec.get("status") == 204 and delta_t == {"accepted": 1})
+    return p3_verdict(others_ok, res["rule_wait_ge_session_a_hold"], res["waiter"], res["session_a_lock_hold_s"])
+
+
+def p3_wait_vs_hold(wait_lower, wait_upper, hold_lower, hold_upper):
+    """Revision 10 P3: 'the ingest's wait >= the hold', where the hold is how long Session A held the lock.
+    'met' only if the wait's lower bound reaches the hold's upper bound; 'not met' if the wait's upper bound is below the
+    hold's lower bound; otherwise the measurement cannot decide."""
+    if wait_upper is None:
+        return "undetermined"
+    if wait_lower >= hold_upper:
+        return "met"
+    if wait_upper < hold_lower:
+        return "not met"
+    return "undetermined"
+
+
+def p3_verdict(others_ok, wait_vs_hold, waiter, a_hold):
+    if not others_ok:
+        return "FAIL"
+    if wait_vs_hold == "met":
+        return "PASS"
+    return (f"UNRESOLVED: Revision 10 P3 'wait >= the hold' {wait_vs_hold} - ingest wait "
+            f"{waiter['observed_wait_s_lower_bound']}-{waiter['observed_wait_s_upper_bound']} s, Session A lock hold "
+            f"{a_hold['lower_bound']}-{a_hold['upper_bound']} s (all other P3 checks passed; owner decision needed)")
 
 
 def consistency(db, today):

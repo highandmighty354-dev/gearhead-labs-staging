@@ -117,8 +117,12 @@ contract is an A4 assumption for the owner to confirm in A9.**
   - The wait's bounds come from `pg_locks` sample times only, never from HTTP timing.
   - If no waiter is seen within 1.25 s of the rollup call, A commits and P3 is INCONCLUSIVE ("arrives after A
     commits"). This keeps A's whole hold under the 3 s lock wait; the total hold is recorded and checked.
-  - Locally the wait measured 1.504–1.562 s, and A's whole hold 1.59–1.61 s. Revision 10's rule (wait ≥ 1.5 s and
-    < 3 s) was met literally.
+  - **Revision 10's rule "the ingest's wait ≥ the hold" cannot be met literally.** The ingest can only begin waiting
+    after Session A holds the lock, and stops when A commits, so its wait is always shorter than A's hold.
+    - Locally the measured ranges overlap (for example: wait 1.518–1.562 s; A's lock hold 1.548–1.589 s). The
+      measurement alone therefore reads "undetermined", and the reasoning above shows the rule cannot be met.
+    - P3 reports `UNRESOLVED: … not met|undetermined …` with both measurements when every other check passes. It
+      never reports PASS unless the measured wait provably reaches A's hold. An owner decision is needed.
 - **P3 identification:** this needs the database user to see other sessions' query text. Without it, P3 is
   INCONCLUSIVE; a lock wait is never inferred from HTTP timing.
 - **D4 BLIE:** over HTTP/1.1, the bytes after `Content-Length: 100` are not part of the request; a server sees them as

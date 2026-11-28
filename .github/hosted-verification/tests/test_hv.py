@@ -193,6 +193,24 @@ class Unit(unittest.TestCase):
         self.assertEqual(sorted(set(writes)), ["SELECT public.analytics_rollup_pending()"])
         self.assertEqual(len(re.findall(r'"SELECT public\.analytics_rollup\(%s::date\)"', src)), 1, "P3's one rollup call")
 
+    def test_p3_wait_vs_session_a_hold(self):
+        f = hv.p3_wait_vs_hold
+        self.assertEqual(f(1.60, 1.65, 1.50, 1.58), "met")          # wait's lower bound reaches A's hold upper bound
+        self.assertEqual(f(1.50, 1.55, 1.56, 1.60), "not met")      # the case seen locally: wait < A's hold
+        self.assertEqual(f(1.50, 1.60, 1.55, 1.58), "undetermined")  # overlapping bounds decide nothing
+        self.assertEqual(f(1.60, None, 1.50, 1.58), "undetermined")
+
+    def test_p3_verdict_never_passes_unless_rule_met(self):
+        w, a = {"observed_wait_s_lower_bound": 1.5, "observed_wait_s_upper_bound": 1.55}, {"lower_bound": 1.56, "upper_bound": 1.6}
+        self.assertEqual(hv.p3_verdict(True, "met", w, a), "PASS")
+        for state in ("not met", "undetermined"):
+            v = hv.p3_verdict(True, state, w, a)
+            self.assertTrue(v.startswith(f"UNRESOLVED: Revision 10 P3 'wait >= the hold' {state}"), v)
+            self.assertIn("1.5-1.55 s", v)
+            self.assertIn("1.56-1.6 s", v)
+        for state in ("met", "not met", "undetermined"):
+            self.assertEqual(hv.p3_verdict(False, state, w, a), "FAIL")
+
     def test_tls_verification_refuses_untrusted_certificate(self):
         d = tempfile.mkdtemp()
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{d}/k.pem", "-out", f"{d}/c.pem",
@@ -573,7 +591,7 @@ class Integration(unittest.TestCase):
             v = hv.run_suite(ctx)
             r = ev.doc["results"]["P3"]
             w = r["waiter"]
-            print("\n    P3 timing:", json.dumps({**w, "a_total_hold_s": r["a_total_hold_s"]}), "verdict", v, file=sys.stderr)
+            print("\n    P3 timing:", json.dumps({**w, "session_a_lock_hold_s": r["session_a_lock_hold_s"]}), "verdict", v, file=sys.stderr)
             self.assertEqual(r["hold_outcome"], "held")
             self.assertTrue(w["identified_as_analytics_ingest"], "the waiting session is the ingest (pg_stat_activity)")
             self.assertTrue(r["pg_locks_snapshot_shows_a_and_ingest"])
@@ -586,10 +604,16 @@ class Integration(unittest.TestCase):
             self.assertLess(tl["first_waiter_seen"], tl["hold_demonstrated"])
             self.assertLessEqual(tl["hold_demonstrated"], tl["commit"])
             self.assertGreaterEqual(w["hold_demonstrated_s_after_first_wait"], hv.HOLD_S)
-            # the literal Revision 10 rule, from pg_locks sample times only
+            # wait bounds from pg_locks sample times only
             self.assertGreaterEqual(w["observed_wait_s_lower_bound"], hv.HOLD_S)
             self.assertLess(w["observed_wait_s_upper_bound"], hv.LOCK_TIMEOUT_S)
-            self.assertTrue(r["rule_wait_ge_hold_and_lt_3s"])
+            self.assertTrue(r["rule_wait_lt_3s"])
+            # Revision 10 compares the wait with THE HOLD (Session A's lock hold). The ingest starts waiting only after A holds
+            # the lock, so the wait cannot reach the hold: measured, that shows as "not met" or (overlapping bounds) "undetermined"
+            a = r["session_a_lock_hold_s"]
+            self.assertGreaterEqual(a["lower_bound"], hv.HOLD_S)
+            self.assertLess(w["observed_wait_s_lower_bound"], a["upper_bound"], "the wait never reaches A's hold")
+            self.assertIn(r["rule_wait_ge_session_a_hold"], ("not met", "undetermined"))
             self.assertTrue(r["a_total_hold_under_3s"])
             self.assertTrue(r["session_a_lock_granted_seen"])
             self.assertTrue(r["l1_id_above_watermark"])
@@ -597,7 +621,8 @@ class Integration(unittest.TestCase):
             self.assertTrue(r["consistency"]["ok"])
             self.assertEqual(r["http"]["status"], 204)
             self.assertEqual(r["stats_delta_test"], {"accepted": 1}, "accepted, not busy")
-            self.assertEqual(v, "PASS")
+            self.assertTrue(v.startswith("UNRESOLVED: Revision 10 P3 'wait >= the hold' " + r["rule_wait_ge_session_a_hold"]), v)
+            self.assertNotEqual(v, "PASS")
             self.write_evidence(ev)
         finally:
             self.admin("REVOKE pg_read_all_stats FROM postgres")
