@@ -829,8 +829,11 @@ def suite_d1(ctx):
     if not contract_ok:
         ev.inconclusive("D1: at least one probe reply did not match the probe contract; those cases are not determined.")
         return "NOT DETERMINED"
-    if any(c.get("platform_rejection_or_error") for c in cases):
-        ev.inconclusive("D1: the platform refused or failed some requests before the probe answered (recorded per case).")
+    rejected = [c["case"] for c in cases if c.get("platform_rejection_or_error")]
+    if rejected:
+        ev.inconclusive("D1: the platform refused or failed some requests before the probe answered, so their chunk sizes "
+                        "were not observed (recorded per case): " + ", ".join(rejected))
+        return "INCONCLUSIVE: chunk sizes not observed for " + ", ".join(rejected)
     return "PASS (observations recorded)"
 
 
@@ -865,7 +868,7 @@ def local_decode(b):
 
 def suite_d3(ctx):
     ev = ctx.ev
-    out, all_equal, contract_ok = [], True, True
+    out, all_equal, contract_ok, refused = [], True, True, []
     for n, c in enumerate(d3_cases(ctx)):
         rec, p = probe_call(ctx, "D3-" + c["case"], "decode", c["bytes"], **c["send"])
         if n == 0 and rec["status"] == 404:
@@ -882,6 +885,8 @@ def suite_d3(ctx):
                       "observed_fffd": got.count(0xFFFD), "outcome": p["outcome"],
                       "equal_byte_for_byte": got == exp and p["outcome"] == "accepted",
                       "starts_with_bom": bool(got) and got[0] == 0xFEFF})
+            if p["outcome"] != "accepted":
+                refused.append(c["case"])
             if c.get("split_chars"):
                 r["split_chars_decoded_once"] = all(got.count(ord(ch)) == 1 for ch in c["split_chars"])
             if got != exp:
@@ -898,7 +903,13 @@ def suite_d3(ctx):
     if not contract_ok:
         ev.inconclusive("D3: some cases got no valid probe reply; not determined.")
         return "NOT DETERMINED"
-    return "PASS" if all_equal else "FAIL"
+    if not all_equal:
+        return "FAIL"
+    if refused:   # Revision 10: "Refusing invalid UTF-8 remains an open decision" - a refusal is never a pass
+        ev.inconclusive("D3: the probe refused the decode for " + ", ".join(refused) + "; whether invalid UTF-8 should be "
+                        "refused is an open decision in Revision 10, so these cases are not passed.")
+        return "INCONCLUSIVE: decode refused for " + ", ".join(refused)
+    return "PASS"
 
 
 def suite_d4(ctx):

@@ -290,6 +290,69 @@ class MainRefusals(unittest.TestCase):
         self.refused(good_env(HV_SUITE="ALL"), "suite")
 
 
+class ProbeVerdicts(unittest.TestCase):
+    """Regression tests (PR #5 audit): a refused D3 decode and a D1 platform rejection are never PASS. No database needed."""
+
+    def run_probe_suite(self, suite, **standin_kw):
+        st = standin.StandIn(origin=ORIGIN, **standin_kw)
+        self.addCleanup(st.close)
+        ev = hv.Evidence({"suite": suite, "run_id": "1"})
+        ctx = hv.Ctx(suite, next_run_id(), ORIGIN, hv.Target("http", "127.0.0.1", st.port), ev)
+        return hv.run_suite(ctx), ev
+
+    def test_d3_accepted_decode_still_passes(self):
+        v, ev = self.run_probe_suite("D3")
+        self.assertEqual(v, "PASS")
+
+    def test_d3_refused_decode_with_matching_code_points_is_not_pass(self):
+        v, ev = self.run_probe_suite("D3", probe_refuse_decode=True)
+        cases = ev.doc["results"]["D3"]["cases"]
+        refused = [c["case"] for c in cases if c["outcome"] == "refused"]
+        self.assertTrue(refused)
+        self.assertTrue(all(c["observed_sha256"] == c["expected_sha256"] for c in cases), "code points still match")
+        self.assertTrue(all(not c["equal_byte_for_byte"] for c in cases if c["outcome"] == "refused"))
+        self.assertNotEqual(v, "PASS")
+        self.assertEqual(v, "INCONCLUSIVE: decode refused for " + ", ".join(refused))
+        self.assertTrue(any("open decision in Revision 10" in x for x in ev.doc["inconclusive"]))
+
+    def test_d3_refused_exit_status_is_not_pass(self):
+        orig = hv.run_suite
+        hv.run_suite = lambda ctx: "INCONCLUSIVE: decode refused for B2-7-fffe"
+        self.addCleanup(setattr, hv, "run_suite", orig)
+        orig_connect, orig_assert = hv.connect, hv.assert_tls
+        hv.connect, hv.assert_tls = (lambda *a, **k: None), (lambda *a, **k: None)
+        self.addCleanup(setattr, hv, "connect", orig_connect)
+        self.addCleanup(setattr, hv, "assert_tls", orig_assert)
+        self.assertEqual(hv.main(good_env(HV_SUITE="D3")), 2, "a non-PASS verdict exits 2, so the run shows failed")
+
+    def test_d1_platform_rejection_is_inconclusive(self):
+        v, ev = self.run_probe_suite("D1", probe_reject_over=65536)
+        cases = ev.doc["results"]["D1"]["cases"]
+        rejected = [c["case"] for c in cases if c.get("platform_rejection_or_error")]
+        self.assertEqual(rejected, ["D1-1048576-content-length", "D1-1048576-chunked", "D1-1048576-slow-chunked"])
+        self.assertTrue(all(c["status"] == 413 and "chunks" not in c for c in cases if c["case"] in rejected))
+        self.assertEqual(len([c for c in cases if "chunks" in c]), 12, "the other observations are kept")
+        self.assertNotIn("PASS", v)
+        self.assertEqual(v, "INCONCLUSIVE: chunk sizes not observed for " + ", ".join(rejected))
+        self.assertTrue(any("not observed" in x for x in ev.doc["inconclusive"]))
+
+    def test_d1_without_rejection_still_passes(self):
+        v, _ = self.run_probe_suite("D1")
+        self.assertEqual(v, "PASS (observations recorded)")
+
+    def test_non_pass_verdicts_exit_2(self):
+        for verdict, code in (("PASS", 0), ("INCONCLUSIVE: chunk sizes not observed for D1-1048576-chunked", 2),
+                              ("INCONCLUSIVE: decode refused for B2-7-fffe", 2), ("FAIL", 2)):
+            orig = hv.run_suite
+            hv.run_suite = lambda ctx, v=verdict: v
+            orig_connect, orig_assert = hv.connect, hv.assert_tls
+            hv.connect, hv.assert_tls = (lambda *a, **k: None), (lambda *a, **k: None)
+            try:
+                self.assertEqual(hv.main(good_env(HV_SUITE="D1")), code, verdict)
+            finally:
+                hv.run_suite, hv.connect, hv.assert_tls = orig, orig_connect, orig_assert
+
+
 @unittest.skipUnless(PG and PG_ADMIN, "local PostgreSQL stand-in not configured (HV_TEST_PG_URL, HV_TEST_PG_ADMIN_URL)")
 class Integration(unittest.TestCase):
     """Each suite end to end against the local PostgreSQL 17 stand-in and the HTTP stand-ins."""

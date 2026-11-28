@@ -36,9 +36,11 @@ on:
 # No permissions at workflow level; each job asks only for read access.
 permissions: {}
 
-# One run at a time; a queued run never cancels a running test.
+# Shares the repository-wide group with the migration and validation workflows: GitHub runs at most one of them at a
+# time and never cancels a running one. A newer queued run in the group replaces an older one still pending (GitHub's
+# rule), so start one run at a time. check_no_other_runs is a separate point-in-time check, not a lock.
 concurrency:
-  group: hosted-verification
+  group: staging-migrations
   cancel-in-progress: false
 
 defaults:

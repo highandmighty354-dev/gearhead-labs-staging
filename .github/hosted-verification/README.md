@@ -16,7 +16,8 @@ configures or opens anything.
    - the typed ref, with the same four-way target check the migration workflow uses (production refused);
    - `ANALYTICS_TEST_ORIGIN` and the suite's prerequisites;
    - the `staging-db` Environment: only the owner may approve, and only `main` may use it;
-   - that no other staging migration, validation or hosted-verification run is queued or running;
+   - that no other staging migration, validation or hosted-verification run is queued or running (a point-in-time
+     check, not a lock; see "Concurrency" below);
    - TLS of the database pooler against the pinned Supabase roots.
 2. **Verify** waits for the owner's approval in `staging-db`. It then:
    - repeats every check above;
@@ -34,6 +35,15 @@ Before writing, the runner refuses to save anything that contains:
 - an IP address.
 
 Request bodies are never recorded.
+
+**Concurrency.** This workflow uses the same repository-wide group, `staging-migrations`, as the migration and
+validation workflows, with `cancel-in-progress: false`. In GitHub's rules, that means:
+- At most one run in the group is in progress, and a running one is never cancelled.
+- At most one more waits as pending. If a newer run joins the group while one is pending, GitHub cancels the pending
+  run and the newer one takes its place.
+
+So start one staging run at a time. The "no other run" check above is a point-in-time check made twice per run
+(before and after approval); it is not an atomic lock.
 
 Exit status: `0` = PASS, `2` = the suite ran and the verdict is anything else, `1` = refused or error. A run that is not
 PASS shows red, so its verdict gets read.

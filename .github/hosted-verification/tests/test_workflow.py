@@ -40,7 +40,10 @@ class Workflow(unittest.TestCase):
         self.assertEqual(self.wf["permissions"], {})
         for j in self.jobs.values():
             self.assertEqual(j["permissions"], {"contents": "read", "actions": "read"})
-        self.assertEqual(self.wf["concurrency"], {"group": "hosted-verification", "cancel-in-progress": False})
+        self.assertEqual(self.wf["concurrency"], {"group": "staging-migrations", "cancel-in-progress": False})
+        for other in ("staging-migrations.yml", "staging-validation.yml"):
+            with open(os.path.join(ROOT, ".github", "workflows", other)) as f:
+                self.assertEqual(yaml.safe_load(f)["concurrency"], self.wf["concurrency"], f"same repository-wide group as {other}")
 
     def test_only_the_approved_job_has_the_environment_and_secret(self):
         self.assertNotIn("environment", self.jobs["preflight"])

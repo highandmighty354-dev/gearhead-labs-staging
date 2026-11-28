@@ -96,9 +96,11 @@ def decode(b):
 
 class StandIn:
     def __init__(self, db_url=None, origin="https://test-site.example", receiver=True, probe=True, enabled=True,
-                 latency_s=0.0, ingest_connect=None):
+                 latency_s=0.0, ingest_connect=None, probe_refuse_decode=False, probe_reject_over=None):
         self.db_url, self.origin, self.receiver, self.probe, self.enabled = db_url, origin, receiver, probe, enabled
         self.latency_s = latency_s
+        self.probe_refuse_decode = probe_refuse_decode    # regression tests: probe says "refused" but returns the code points
+        self.probe_reject_over = probe_reject_over        # regression tests: bodies over this size get a platform-style 413
         self.requests = []          # (method, path) of every request received
         self.logs = []
         self.lock = threading.Lock()
@@ -128,7 +130,7 @@ class StandIn:
             threading.Thread(target=self._handle, args=(s,), daemon=True).start()
 
     def _reply(self, s, status, headers=(), body=b""):
-        reason = {200: "OK", 204: "No Content", 404: "Not Found"}.get(status, "X")
+        reason = {200: "OK", 204: "No Content", 404: "Not Found", 413: "Payload Too Large"}.get(status, "X")
         h = [f"HTTP/1.1 {status} {reason}"] + [f"{k}: {v}" for k, v in headers] + ["Connection: close"]
         if status != 204:
             h.append(f"Content-Length: {len(body)}")
@@ -233,6 +235,8 @@ class StandIn:
                 if first is None:
                     first = (time.monotonic() - t0) * 1000
                 sizes.append(len(ch))
+            if self.probe_reject_over is not None and sum(sizes) > self.probe_reject_over:
+                return self._reply(s, 413, [("Content-Type", "text/plain")], b"Payload Too Large")
             dl = h.get("content-length")
             out = {"mode": "chunks", "chunks": sizes, "total": sum(sizes),
                    "declared_length": int(dl) if dl and dl.isdigit() else None,
@@ -245,7 +249,8 @@ class StandIn:
                     break
                 kept += ch
             cps = [] if oversize else [ord(x) for x in decode(kept)]
-            out = {"mode": "decode", "outcome": "refused" if oversize else "accepted", "oversize": oversize,
+            refused = oversize or (self.probe_refuse_decode and 0xFFFD in cps)
+            out = {"mode": "decode", "outcome": "refused" if refused else "accepted", "oversize": oversize,
                    "bytes": len(kept), "code_points": cps}
         else:
             return self._reply(s, 404, [("Content-Type", "application/json")], b'{"code":"NOT_FOUND"}')
