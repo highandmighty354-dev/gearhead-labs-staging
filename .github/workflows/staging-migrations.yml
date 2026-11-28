@@ -1,13 +1,15 @@
-# Gearhead Labs STAGING - apply PR #31's migrations to the staging Supabase project
+# Gearhead Labs STAGING - apply the approved migrations (PR #31's 0001-0410, then 0501) to the staging Supabase project
 # File: .github/workflows/staging-migrations.yml in highandmighty354-dev/gearhead-labs-staging ONLY.
 #
-# PROPOSAL FOR OWNER REVIEW, revision 4 (2026-11-23). Not committed; revision 3 (c1c3588e) is the committed version.
+# Revision 5 (2026-11-27, A3 of the hosted TEST verification procedure, revision 10; owner decision Option A):
+# adds Stage 3, migration 0501_analytics.sql only, after 0410 is recorded. Order: 0001-0409 -> 0410 -> 0501.
+# Earlier revisions, both committed: revision 3 (a7c4e13, 2026-11-21); revision 4 (c781244, 2026-11-23).
 # Revision 3: project refs may contain digits ([a-z0-9]{20}); every database connection verifies TLS against the two
 # pinned Supabase root CAs with hostname checking (verify-full), plus a TLS probe before the password exists; the
 # staging-db Environment's protection settings are read from GitHub and must match before anything runs.
 # Revision 4: the TLS probe accepts OpenSSL's verified wildcard peer name; OpenSSL still does the hostname check.
 #
-# What this workflow can do: apply the 20 approved migration files, in two stages, to the ONE Supabase
+# What this workflow can do: apply the 21 approved migration files, in three stages, to the ONE Supabase
 # project named in this repository's settings, after you approve each run.
 # What it cannot do: anything on its own (manual start only), anything outside this repository (its token is
 # read-only and scoped to this repository), or reach production (production's password is not in this repository).
@@ -25,9 +27,9 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: "1 = migrations 0001-0409 into the EMPTY staging project. 2 = migration 0410 only (needs stage 1 complete)."
+        description: "1 = migrations 0001-0409 into the EMPTY staging project. 2 = migration 0410 only (needs stage 1 complete). 3 = migration 0501 only (needs 0410 recorded)."
         type: choice
-        options: ["1", "2"]
+        options: ["1", "2", "3"]
         required: true
       mode:
         description: "dry-run = report what would be applied, change nothing. apply = change the staging database."
@@ -40,7 +42,7 @@ on:
         type: string
         required: true
       confirm_apply:
-        description: "apply only: APPLY-STAGE-1 for stage 1, APPLY-STAGE-2 for stage 2. Must be EMPTY for dry-run."
+        description: "apply only: APPLY-STAGE-1 for stage 1, APPLY-STAGE-2 for stage 2, APPLY-STAGE-3 for stage 3. Must be EMPTY for dry-run."
         type: string
         required: false
         default: ""
@@ -60,7 +62,8 @@ defaults:
 env:
   STAGING_REPOSITORY: "highandmighty354-dev/gearhead-labs-staging"
   PRODUCTION_REF: "jmztpjudwzjvrcdtjynd"     # always refused, everywhere
-  SOURCE_COMMIT: "62b8a65f535da3d67eeab3e7d06bf50312280b39"   # PR #31 commit the 20 files were copied from
+  SOURCE_COMMIT: "62b8a65f535da3d67eeab3e7d06bf50312280b39"   # PR #31 commit the 20 files 0001-0410 were copied from
+  SOURCE_COMMIT_0501: "215b1a0fd748c8bc72595caa1418d562d7e6a627"   # gearhead-labs main commit 0501_analytics.sql was copied from
   SUPABASE_CLI_VERSION: "2.119.0"            # same version production's provisioning workflow pins
   # Release asset of github.com/supabase/cli tag v2.119.0, and its SHA-256 from that release's checksums.txt.
   SUPABASE_CLI_URL: "https://github.com/supabase/cli/releases/download/v2.119.0/supabase_2.119.0_linux_amd64.tar.gz"
@@ -136,7 +139,7 @@ env:
       [ "${REPO:-}" = "$STAGING_REPOSITORY" ] || fail "running in '${REPO:-?}', not $STAGING_REPOSITORY"
       [ "${GIT_REF:-}" = refs/heads/main ] || fail "started from '${GIT_REF:-?}', not refs/heads/main"
       [ "${RUN_ATTEMPT:-}" = 1 ] || fail "this is re-run attempt ${RUN_ATTEMPT:-?}; re-runs are refused - start a new run (new confirmation, new approval)"
-      case "${STAGE:-}" in 1|2) ;; *) fail "stage must be 1 or 2, got '${STAGE:-}'" ;; esac
+      case "${STAGE:-}" in 1|2|3) ;; *) fail "stage must be 1, 2 or 3, got '${STAGE:-}'" ;; esac
       case "${MODE:-}" in
         dry-run) [ -z "${CONFIRM_APPLY:-}" ] || fail "confirm_apply must be EMPTY for a dry run (got a value)" ;;
         apply)   [ "${CONFIRM_APPLY:-}" = "APPLY-STAGE-$STAGE" ] || fail "apply for stage $STAGE needs exactly APPLY-STAGE-$STAGE in confirm_apply" ;;
@@ -144,9 +147,9 @@ env:
       esac
     }
 
-    # --- B. The 20 approved files and their SHA-256 -------------------------------------------------
+    # --- B. The 21 approved files and their SHA-256 -------------------------------------------------
     # 0001-0409: the same 19 hashes production's provisioning workflow pins (commit c69ec51).
-    # 0410: PR #31 at 62b8a65. There is no 0501 here and none is accepted.
+    # 0410: PR #31 at 62b8a65. 0501: gearhead-labs main at 215b1a0 (hash as in the hosted TEST procedure, revision 10).
     write_manifest() {
       cat > "$1" <<'EOF'
     e6ff6301b302bd794ee6bdb1ddc65cc2ebd9de9c8e27c141ae5403b2092432e6  0001_enums.sql
@@ -169,17 +172,18 @@ env:
     df92a3e050bc7cbc46d5e1c1d6fe3822a7a82db58a2ebc5fe3965138380c4c49  0408_formula_versions_corrected_formulas.sql
     29cbdcd08bda08630126e65f89a99f1226766d8568c58330486f3262d61f5534  0409_formula_versions_fuel_pump_validity.sql
     355c0c137a94b9683e9f9b31af381361716f1f4017a0513a6dcae6bbf890905e  0410_formula_versions_stage2_calculator_repairs.sql
+    8762f0fe793f10404d744befdaef35aafc9424409a5206ac162fa20392fc8098  0501_analytics.sql
     EOF
     }
 
-    # verify_files DIR MANIFEST: exactly the 20 approved names (no other file, folder or link), every hash equal.
+    # verify_files DIR MANIFEST: exactly the 21 approved names (no other file, folder or link), every hash equal.
     verify_files() {
       local dir="$1" man="$2" expected actual
       [ -d "$dir" ] && [ ! -L "$dir" ] || fail "migration folder $dir is missing or is a link"
-      [ "$(grep -c . "$man")" = 20 ] || fail "the manifest does not have exactly 20 entries"
+      [ "$(grep -c . "$man")" = 21 ] || fail "the manifest does not have exactly 21 entries"
       expected="$(awk '{print $2}' "$man" | sort)"
       actual="$(find "$dir" -mindepth 1 -printf '%P\n' | sort)"
-      [ "$expected" = "$actual" ] || { diff <(echo "$expected") <(echo "$actual") >&2 || true; fail "$dir does not hold exactly the 20 approved files"; }
+      [ "$expected" = "$actual" ] || { diff <(echo "$expected") <(echo "$actual") >&2 || true; fail "$dir does not hold exactly the 21 approved files"; }
       [ -z "$(find "$dir" -mindepth 1 ! -type f)" ] || fail "$dir contains something that is not a regular file"
       ( cd "$dir" && sha256sum --strict --quiet -c "$man" ) || fail "a migration file's SHA-256 does not match the approved hash"
     }
@@ -188,7 +192,8 @@ env:
     stage_files() {
       case "$1" in
         1) awk '{print $2}' "$2" | sort | grep -E '^0([0-3][0-9]{2}|40[0-9])_' ;;   # 0001-0409: 19 files
-        2) awk '{print $2}' "$2" | sort ;;                                         # all 20: 0410 is the only new one
+        2) awk '{print $2}' "$2" | sort | grep -E '^0([0-3][0-9]{2}|40[0-9]|410)_' ;;   # 0001-0410: 20 files; 0410 is the only new one
+        3) awk '{print $2}' "$2" | sort ;;                                         # all 21: 0501 is the only new one
         *) fail "unknown stage '$1'" ;;
       esac
     }
@@ -197,12 +202,13 @@ env:
       case "$1" in
         1) stage_files 1 "$2" ;;
         2) echo "0410_formula_versions_stage2_calculator_repairs.sql" ;;
+        3) echo "0501_analytics.sql" ;;
         *) fail "unknown stage '$1'" ;;
       esac
     }
     # expected_history_before / _after STAGE MANIFEST: the recorded versions the database must show.
     versions_of() { sed -E 's/^([0-9]{4})_.*/\1/'; }
-    expected_history_before() { case "$1" in 1) : ;; 2) stage_files 1 "$2" | versions_of ;; esac; }
+    expected_history_before() { case "$1" in 1) : ;; 2) stage_files 1 "$2" | versions_of ;; 3) stage_files 2 "$2" | versions_of ;; esac; }
     expected_history_after()  { stage_files "$1" "$2" | versions_of; }
 
     # build_stage_dir STAGE MANIFEST WORKDIR: copies ONLY that stage's files, unchanged, into WORKDIR/supabase/migrations,
@@ -425,7 +431,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Verify the 20 files and the staging target
+      - name: Verify the 21 files and the staging target
         env:
           EXPECTED_TEST_REF: ${{ vars.EXPECTED_TEST_REF }}
           POOLER_URL: ${{ vars.STAGING_POOLER_URL }}
@@ -439,8 +445,8 @@ jobs:
           ref="$(verify_target)"
           {
             echo "### Preflight passed - stage $STAGE $MODE"
-            echo "- Commit: \`$COMMIT\` (files copied from PR #31 at \`$SOURCE_COMMIT\`)"
-            echo "- 20 migration files present, no others; all 20 SHA-256 hashes match"
+            echo "- Commit: \`$COMMIT\` (0001-0410 copied from PR #31 at \`$SOURCE_COMMIT\`; 0501 from gearhead-labs main at \`$SOURCE_COMMIT_0501\`)"
+            echo "- 21 migration files present, no others; all 21 SHA-256 hashes match"
             echo "- Target: staging project \`$ref\` (variable, pooler URL, typed ref and supabase-config.js agree; production \`$PRODUCTION_REF\` refused)"
             echo "- Next: the migrate job waits for your approval in the staging-db Environment"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -554,7 +560,7 @@ jobs:
           # 2) Sequencing: the recorded history must be exactly what this stage expects BEFORE it runs.
           before="$(history_versions)"
           [ "$before" = "$(expected_history_before "$STAGE" "$man")" ] \
-            || fail "stage $STAGE cannot start: the database's recorded history is not what this stage requires (stage 1 needs an empty history; stage 2 needs exactly 0001-0409)"
+            || fail "stage $STAGE cannot start: the database's recorded history is not what this stage requires (stage 1 needs an empty history; stage 2 needs exactly 0001-0409; stage 3 needs exactly 0001-0410)"
 
           # 3) Dry run from the verified, read-only stage folder.
           cd "$work"
@@ -588,7 +594,7 @@ jobs:
             {
               echo
               echo "**Stage $STAGE FAILED (CLI exit status $rc).** Nothing was retried or rolled back. Files marked NOT recorded did not complete."
-              echo "The failing file may have left part of its work behind (13 of the files manage their own transactions), so treat the staging database as unknown:"
+              echo "The failing file may have left part of its work behind (14 of the 21 files manage their own transactions), so treat the staging database as unknown:"
               echo "delete and recreate the staging project before any new attempt, which needs a new run, a new confirmation and a new approval."
             } | tee -a "$GITHUB_STEP_SUMMARY"
             fail "stage $STAGE apply failed with CLI exit status $rc"
