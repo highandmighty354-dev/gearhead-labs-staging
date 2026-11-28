@@ -271,15 +271,28 @@ async function anon() {
   };
   const tables = exp.exposed_tables;
   if (JSON.stringify(Object.keys(exp.primary_keys).sort()) !== JSON.stringify([...tables].sort())) die('expected.json: primary_keys does not cover exactly the exposed tables');
+  // One value per key type that PostgreSQL accepts for the type and that no real row can hold. A filter literal of the
+  // wrong type would be refused (22P02) before privileges are checked, so every key column gets a value of its own type.
+  const NONE = { uuid: '00000000-0000-0000-0000-000000000000', text: 'gh_validation_no_such_row', bigint: '-1',
+                 date: '1900-01-01', timestamptz: '1900-01-01T00:00:00+00:00', bytea: '\\x00' };
+  const cols = (spec, what) => {
+    const out = String(spec).split(',').map((p) => p.split(':'));
+    for (const c of out) if (c.length !== 2 || !/^[a-z_][a-z0-9_]*$/.test(c[0]) || !Object.hasOwn(NONE, c[1])) die(`expected.json: ${what} "${spec}" is not column:type[,column:type] with a known type`);
+    return out;
+  };
+  const patch = exp.patch_columns || {};
+  for (const t of Object.keys(patch)) if (t !== '_rule' && !tables.includes(t)) die(`expected.json: patch_columns names ${t}, which is not an exposed table`);
   let n = 0;
   for (const t of tables) {
-    const [col, typ] = exp.primary_keys[t].split(':');
-    const none = typ === 'uuid' ? '00000000-0000-0000-0000-000000000000' : 'gh_validation_no_such_row';
-    const filter = `?${col}=eq.${encodeURIComponent(none)}`;
+    const keys = cols(exp.primary_keys[t], `primary key of ${t}`);
+    const set = Object.hasOwn(patch, t) ? cols(patch[t], `patch column of ${t}`) : [keys[0]];
+    if (set.length !== 1) die(`expected.json: patch column of ${t} must be exactly one column`);
+    const [col, typ] = set[0];
+    const filter = '?' + keys.map(([k, ty]) => `${k}=eq.${encodeURIComponent(NONE[ty])}`).join('&');
     const probes = [
       ['read', 'GET', `${base}${t}?select=*&limit=5`],
       ['insert', 'POST', `${base}${t}`, '[]'],
-      ['update', 'PATCH', `${base}${t}${filter}`, JSON.stringify({ [col]: none })],
+      ['update', 'PATCH', `${base}${t}${filter}`, JSON.stringify({ [col]: typ === 'bigint' ? Number(NONE[typ]) : NONE[typ] })],
       ['delete', 'DELETE', `${base}${t}${filter}`],
     ];
     for (const [what, m, url, body] of probes) {

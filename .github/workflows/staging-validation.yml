@@ -8,7 +8,7 @@
 # waits for the owner's approval on every run. Its files in .github/validation/ are hash-pinned below.
 #
 # What it checks, all against the ONE staging project pinned below:
-#   preflight   (no secret)                 how the run started, the typed project ref, the pinned staging target, the 20
+#   preflight   (no secret)                 how the run started, the typed project ref, the pinned staging target, the 21
 #                                           migration files, the validation files, the approval gate, the Pages build of
 #                                           THIS commit, and the database's TLS certificate (no password)
 #   repo-tests  (no secret)                 fast gate (9 steps) and the full browser regression (51 suites), including the
@@ -71,11 +71,11 @@ env:
     aa6ebc10f1c1050d2c83ec395fccc4213d07dec1edc1999e906c72fdac8224c3  .github/validation/db-audit.sql
     acaf04f285392357a06eb9d6a0a8cb7bb09cc47f34c28e7045405009c0571733  .github/validation/db-counts.sql
     1c790e82e33b806605639cab24bd464f02571e777a5b0f9a31e800a5f5d119c5  .github/validation/db-matrix.sql
-    38fe9906342a925479ea639981faf99ae9729f29310035999dcc9d1fc122bca0  .github/validation/db_check.py
-    a41a92515343feeea31154669d7a2f72e203e653330250bc03058b7938fbccbd  .github/validation/expected.json
+    ac7bc2b112273b8ba95341a4bb9d018ef3f216585eb2e32cf55f1f7d1a51923a  .github/validation/db_check.py
+    313428715914d0eb9509c10906e54728cc845c8b1e9613fec4735312779e20dc  .github/validation/expected.json
     4afcaeb10be548c4e604d38e89a50fef36bab2b3c258cc463f082df0d12a170e  .github/validation/history.pack
     cea04901f64e959ee70a8d4e40e32dd545d6e54d1a047ab3f3ff91464d311d51  .github/validation/history.txt
-    98e2b444ae5f685e3e112e542eb9de52aea42d0d3e9e6ee5e129b07fa82b32d9  .github/validation/site_check.mjs
+    38fa558eaee3a3f24f48b9247633ccd5a4691342a257396ff7e05556a49fa25d  .github/validation/site_check.mjs
     68596434d3238152aac665618b5b013812bba0494933f6c59d1c94869e9437cd  premium-foundation/tests/sql/000_hosted_supabase_shim.sql
   # Supabase's two root CAs (from github.com/supabase/cli tag v2.119.0), identical to staging-migrations.yml.
   SUPABASE_ROOT_CA_SHA256_FINGERPRINTS: "5F9B77951A7AA1303F9B58EEA9BFA89E358CFDC15F9786FF10D4930A722C9AE2 807025AD50D4ED219D2C9C7D299C004F824EB00CF7F65AFEF607D07B72E6CAFA"
@@ -154,7 +154,8 @@ env:
       [ -z "$(find .github/validation -mindepth 1 ! -type f ! -type d)" ] || fail ".github/validation holds a link or special file"
     }
 
-    # The 20 migration files, unchanged (same hashes as staging-migrations.yml). The replica is built from these.
+    # The 21 migration files, unchanged (same hashes as staging-migrations.yml). The replica is built from these.
+    # Final state only (A15): staging must record exactly these 21, in this order: 0001-0409, 0410, 0501.
     write_manifest() {
       cat > "$1" <<'EOF'
     e6ff6301b302bd794ee6bdb1ddc65cc2ebd9de9c8e27c141ae5403b2092432e6  0001_enums.sql
@@ -177,6 +178,7 @@ env:
     df92a3e050bc7cbc46d5e1c1d6fe3822a7a82db58a2ebc5fe3965138380c4c49  0408_formula_versions_corrected_formulas.sql
     29cbdcd08bda08630126e65f89a99f1226766d8568c58330486f3262d61f5534  0409_formula_versions_fuel_pump_validity.sql
     355c0c137a94b9683e9f9b31af381361716f1f4017a0513a6dcae6bbf890905e  0410_formula_versions_stage2_calculator_repairs.sql
+    8762f0fe793f10404d744befdaef35aafc9424409a5206ac162fa20392fc8098  0501_analytics.sql
     EOF
     }
     verify_migration_files() {
@@ -184,7 +186,8 @@ env:
       write_manifest "$man"
       [ -d "$dir" ] && [ ! -L "$dir" ] || fail "$dir is missing or is a link"
       expected="$(awk '{print $2}' "$man" | sort)"; actual="$(find "$dir" -mindepth 1 -printf '%P\n' | sort)"
-      [ "$expected" = "$actual" ] || fail "$dir does not hold exactly the 20 approved files"
+      [ "$(wc -l < "$man")" = 21 ] || fail "the migration manifest does not have exactly 21 entries"
+      [ "$expected" = "$actual" ] || fail "$dir does not hold exactly the 21 approved files"
       ( cd "$dir" && sha256sum --strict --quiet -c "$man" ) || fail "a migration file does not match its approved SHA-256"
     }
 
@@ -420,7 +423,7 @@ jobs:
           verify_target
           install_pyyaml | tee -a "$GITHUB_STEP_SUMMARY"
           check_shared_lock | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "Files and target OK: validation files and 20 migration files match their pins; every setting names $STAGING_REF only." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Files and target OK: validation files and 21 migration files match their pins; every setting names $STAGING_REF only." | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Check the approval gate and the Pages deployment (read-only)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -655,7 +658,11 @@ jobs:
           [ "$(basename "$(dirname "$pgbin")")" -ge 14 ] || fail "PostgreSQL on this runner is older than 14"
           mapfile -t versions < <(python3 -c 'import json,sys; [print(v) for v in (lambda o: o.get("counts", o))(json.loads(open(sys.argv[1]).read().strip()))["migrations"]]' "$RUNNER_TEMP/db/before.json")
           files=(); for v in "${versions[@]}"; do f=(supabase/migrations/"$v"_*.sql); [ -f "${f[0]}" ] && [ "${#f[@]}" = 1 ] || fail "staging records migration $v, which is not one of the approved files"; files+=("${f[0]}"); done
-          case "${#files[@]}" in 19|20) ;; *) fail "staging records ${#files[@]} migrations; only 19 (0001-0409) or 20 (+0410) are valid" ;; esac
+          # Final state only: the recorded history must be exactly the 21 approved versions in order (0001-0409, 0410, 0501).
+          write_manifest "$RUNNER_TEMP/replica-manifest.sha256"
+          mapfile -t want < <(awk '{print $2}' "$RUNNER_TEMP/replica-manifest.sha256" | sort | sed -E 's/^([0-9]{4})_.*/\1/')
+          [ "${#want[@]}" = 21 ] || fail "the approved migration list does not have exactly 21 versions"
+          [ "${versions[*]}" = "${want[*]}" ] || fail "staging records [${versions[*]}]; only exactly [${want[*]}] (0001-0409, 0410, 0501) is valid"
           data="$RUNNER_TEMP/replica"; sock="$RUNNER_TEMP/replica-sock"; mkdir -p "$sock"
           "$pgbin/initdb" -D "$data" -A trust -U supabase_admin -E UTF8 --locale=C.UTF-8 > "$RUNNER_TEMP/initdb.log" 2>&1 || fail "initdb failed"
           "$pgbin/pg_ctl" -D "$data" -o "-c listen_addresses='' -c unix_socket_directories=$sock -c port=54399" -l "$RUNNER_TEMP/replica.log" -w start > /dev/null || fail "the replica did not start"

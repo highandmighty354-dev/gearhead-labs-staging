@@ -70,6 +70,13 @@ def audit(live_p, replica_p, expected_p):
         fail(f"views exist in the exposed schema; each must be reviewed: {live['views']}")
     if sorted(live.get("tables", [])) != sorted(exp["exposed_tables"]):
         fail(f"exposed tables {live.get('tables')} differ from the pinned list used by the web-API probes {exp['exposed_tables']}")
+    # Final state (0001-0409, 0410, 0501): the pinned inventory itself must hold exactly public_table_count distinct tables,
+    # and the replica built from the migration files must create exactly that inventory too (not only "the same as staging").
+    inventory = exp.get("exposed_tables")
+    if not isinstance(inventory, list) or len(inventory) != len(set(inventory)) or len(inventory) != exp.get("public_table_count"):
+        fail(f"expected.json: exposed_tables must hold exactly {exp.get('public_table_count')!r} distinct tables, found {inventory!r}")
+    if sorted(rep.get("tables", [])) != sorted(inventory or []):
+        fail(f"the replica built from the migration files creates {rep.get('tables')}, not the pinned {exp.get('public_table_count')}-table inventory")
     for g in live.get("table_grants", []):
         t, who, priv = g.split("|")
         if who in ("anon", "PUBLIC"):
@@ -120,6 +127,10 @@ def matrix(stderr_p, rc, before_p, expected_p):
     if len(sentinels) != 1 or others:
         raise SystemExit(f"HARD FAIL: the matrix did not end on exactly one sentinel (sentinels {len(sentinels)}, other errors {others[:3]})")
     res = json.loads(sentinels[0])
+    # Final state only: the recorded history must be exactly the approved sequence (no missing, extra, duplicate or
+    # out-of-order version). The workflow checks the same list before it builds the replica.
+    if before.get("migrations") != exp["migration_history"]:
+        fail(f"migration history {before.get('migrations')} is not exactly the approved sequence {exp['migration_history']}")
     applied_0410 = exp["migration_0410"]["version"] in before["migrations"]
     ref_totals = {t: before["tables"][t] for t in exp["reference_tables"]}
     seeded = exp["seeded_rows_per_user"]
