@@ -1212,7 +1212,7 @@ def suite_p3(ctx):
     res["next_run_reopened_today"] = (int(n_days) >= 1 and l1_id is not None and wm_after is not None and int(wm_after) >= l1_id)
     res["consistency"] = consistency(db, today)
     ev.doc["results"] = {"P3": res}
-    ev.limitation("P3 follows Revision 11 (SHA-256 bad6ef57...ad6f): A keeps the lock for at least 1.5 s after the identified "
+    ev.limitation("P3 follows Revision 11 (SHA-256 b6f9d726...7663): A keeps the lock for at least 1.5 s after the identified "
                   "ingest is first seen waiting; the wait's bounds come from pg_locks sample times, so their precision is the "
                   "sampling interval plus one monitor query (a gap over 0.25 s makes the interval unreliable: INCONCLUSIVE).")
     for c in (sess_a, mon):

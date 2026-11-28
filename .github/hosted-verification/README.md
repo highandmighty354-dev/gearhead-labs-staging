@@ -2,7 +2,7 @@
 
 The manual, approval-gated workflow that runs the hosted TEST tests of the **Hosted TEST Verification Procedure,
 revision 10** (`Hosted-TEST-Verification-Procedure-C1-B1-revision-10.md`, SHA-256 `7df81020…c482`) against the staging
-project. **P3 follows revision 11** (`…-revision-11.md`, SHA-256 `bad6ef57…ad6f`), which changes P3 only. **A4 only adds this capability.** Running any suite is a separate approval (A10). Nothing here deploys,
+project. **P3 follows revision 11**, committed here as `.github/hosted-verification/Hosted-TEST-Verification-Procedure-C1-B1-revision-11.md` (SHA-256 `b6f9d726449f76786cf84e21e2914016af5efc88ac81abf4732519f86b097663`), which changes P3 only. **A4 only adds this capability.** Running any suite is a separate approval (A10). Nothing here deploys,
 configures or opens anything.
 
 - Workflow: `.github/workflows/hosted-verification.yml`
@@ -60,8 +60,8 @@ PASS shows red, so its verdict gets read.
 | P3 | A7, A8 | • Session A: `analytics_rollup(today)`, holds the lock<br>• L1 sent through the receiver during the hold<br>• a monitor session watches `pg_locks`; A keeps the lock at least 1.5 s after the identified ingest is seen waiting, then commits<br>• then `analytics_rollup_pending()` | `analytics_rollup(today)`, `analytics_rollup_pending()` |
 | P4 | A7, A8 | About 20 minutes, 250 events in 63 requests (about 3 a minute), repeats included<br>• `cron.job_run_details` for the window<br>• final pending rollup | `analytics_rollup_pending()` |
 
-Every event goes through the HTTP receiver. The runner never inserts into an analytics table. The P3 fallback (a direct
-`analytics_ingest()` call) is **not implemented**: this workflow has the HTTP client, and a silent fallback would hide a
+Every event goes through the HTTP receiver. The runner never inserts into an analytics table. P3 sends L1 only through the
+real HTTP receiver, as revision 11 requires; there is no direct `analytics_ingest()` alternative, because one would hide a
 receiver problem.
 
 ## Owner-set repository variables (not set by A4)
