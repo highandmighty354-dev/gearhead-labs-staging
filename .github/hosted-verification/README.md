@@ -2,7 +2,7 @@
 
 The manual, approval-gated workflow that runs the hosted TEST tests of the **Hosted TEST Verification Procedure,
 revision 10** (`Hosted-TEST-Verification-Procedure-C1-B1-revision-10.md`, SHA-256 `7df81020…c482`) against the staging
-project. **A4 only adds this capability.** Running any suite is a separate approval (A10). Nothing here deploys,
+project. **P3 follows revision 11** (`…-revision-11.md`, SHA-256 `bad6ef57…ad6f`), which changes P3 only. **A4 only adds this capability.** Running any suite is a separate approval (A10). Nothing here deploys,
 configures or opens anything.
 
 - Workflow: `.github/workflows/hosted-verification.yml`
@@ -57,7 +57,7 @@ PASS shows red, so its verdict gets read.
 | D3 | A9 probe | Probe `decode` mode:<br>• the five B2-7 invalid sequences<br>• the leading BOM<br>• the B2-7 batch with BOM and invalid bytes<br>• the B2-11 character split across chunks | none |
 | D4 | A7 receiver, A8 window | B8192, B8193, BLIE, B9000. Each in its own window with:<br>• headroom check<br>• before/after snapshots<br>• event-ID check<br>• exact `analytics_ingest_stats` delta | none |
 | D2 | A7, A8 | Two windows:<br>• **O**: 10,485,760 B, chunked, 64 KB every 100 ms, 30 s after the response<br>• **C**: 4,096 B with its true length | none |
-| P3 | A7, A8 | • Session A: `analytics_rollup(today)`, then holds 1.5 s<br>• L1 sent through the receiver during the hold<br>• a monitor session watches `pg_locks`<br>• then `analytics_rollup_pending()` | `analytics_rollup(today)`, `analytics_rollup_pending()` |
+| P3 | A7, A8 | • Session A: `analytics_rollup(today)`, holds the lock<br>• L1 sent through the receiver during the hold<br>• a monitor session watches `pg_locks`; A keeps the lock at least 1.5 s after the identified ingest is seen waiting, then commits<br>• then `analytics_rollup_pending()` | `analytics_rollup(today)`, `analytics_rollup_pending()` |
 | P4 | A7, A8 | About 20 minutes, 250 events in 63 requests (about 3 a minute), repeats included<br>• `cron.job_run_details` for the window<br>• final pending rollup | `analytics_rollup_pending()` |
 
 Every event goes through the HTTP receiver. The runner never inserts into an analytics table. The P3 fallback (a direct
@@ -111,20 +111,21 @@ contract is an A4 assumption for the owner to confirm in A9.**
 
 ## Known limitations (also written into every evidence file that they affect)
 
-- **P3 timing:** the 1.5 s hold is counted from the first `pg_locks` sample that shows the ingest waiting on Session A's
-  lock. A commits only after a sample taken at least 1.5 s later still shows A holding the lock and the same session
-  waiting.
-  - The wait's bounds come from `pg_locks` sample times only, never from HTTP timing.
-  - If no waiter is seen within 1.25 s of the rollup call, A commits and P3 is INCONCLUSIVE ("arrives after A
-    commits"). This keeps A's whole hold under the 3 s lock wait; the total hold is recorded and checked.
-  - **Revision 10's rule "the ingest's wait ≥ the hold" cannot be met literally.** The ingest can only begin waiting
-    after Session A holds the lock, and stops when A commits, so its wait is always shorter than A's hold.
-    - Locally the measured ranges overlap (for example: wait 1.518–1.562 s; A's lock hold 1.548–1.589 s). The
-      measurement alone therefore reads "undetermined", and the reasoning above shows the rule cannot be met.
-    - P3 reports `UNRESOLVED: … not met|undetermined …` with both measurements when every other check passes. It
-      never reports PASS unless the measured wait provably reaches A's hold. An owner decision is needed.
-- **P3 identification:** this needs the database user to see other sessions' query text. Without it, P3 is
-  INCONCLUSIVE; a lock wait is never inferred from HTTP timing.
+- **P3 (revision 11):** once the monitor sees the session identified as `analytics_ingest` waiting on Session A's
+  lock, A keeps the lock until a `pg_locks` sample taken at least 1.5 s later still shows A holding it and the same
+  session waiting. Then A commits.
+  - **Pass** needs every check: the same identified ingest seen waiting continuously for at least 1.5 s and under
+    3 s; a `pg_locks` snapshot showing A holding and the ingest waiting; A's total lock hold under 3 s; L1 above A's
+    watermark; the next run reopening today; and the rollup consistency checks. Any failed check gives
+    `FAIL: <checks>`.
+  - Wait times come from `pg_locks` sample times only, never from HTTP timing. A's total hold uses its upper bound
+    (rollup call to COMMIT returned).
+  - **INCONCLUSIVE**, with the reason, when: no waiter was seen; the identified waiter appeared too late (none within
+    1.25 s of the rollup call, which keeps A's total hold under 3 s); the waiter couldn't be identified; more than one
+    session waited; or the interval can't be established (no sample after the wait, or a gap over 0.25 s between
+    samples). Repeat only with a new run-unique L1.
+- **P3 identification:** this needs the database user to see other sessions' query text. Without it, the 1.5 s never
+  starts and P3 is INCONCLUSIVE; a lock wait is never inferred from HTTP timing.
 - **D4 BLIE:** over HTTP/1.1, the bytes after `Content-Length: 100` are not part of the request; a server sees them as
   a malformed second message.
   - Node's HTTP server answers that with its own `400 Bad Request` by default, and drops the receiver's 204 still in

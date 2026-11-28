@@ -193,23 +193,54 @@ class Unit(unittest.TestCase):
         self.assertEqual(sorted(set(writes)), ["SELECT public.analytics_rollup_pending()"])
         self.assertEqual(len(re.findall(r'"SELECT public\.analytics_rollup\(%s::date\)"', src)), 1, "P3's one rollup call")
 
-    def test_p3_wait_vs_session_a_hold(self):
-        f = hv.p3_wait_vs_hold
-        self.assertEqual(f(1.60, 1.65, 1.50, 1.58), "met")          # wait's lower bound reaches A's hold upper bound
-        self.assertEqual(f(1.50, 1.55, 1.56, 1.60), "not met")      # the case seen locally: wait < A's hold
-        self.assertEqual(f(1.50, 1.60, 1.55, 1.58), "undetermined")  # overlapping bounds decide nothing
-        self.assertEqual(f(1.60, None, 1.50, 1.58), "undetermined")
+    P3_GOOD = {"waiters": 1, "identified": True, "interval_reliable": True, "continuous": True, "wait_lower": 1.51,
+               "wait_upper": 1.56, "snapshot_ok": True, "hold_outcome": "held", "a_hold_upper": 1.62, "l1_above_watermark": True,
+               "next_run_reopened_today": True, "consistency_ok": True, "l1_accepted_once": True}
 
-    def test_p3_verdict_never_passes_unless_rule_met(self):
-        w, a = {"observed_wait_s_lower_bound": 1.5, "observed_wait_s_upper_bound": 1.55}, {"lower_bound": 1.56, "upper_bound": 1.6}
-        self.assertEqual(hv.p3_verdict(True, "met", w, a), "PASS")
-        for state in ("not met", "undetermined"):
-            v = hv.p3_verdict(True, state, w, a)
-            self.assertTrue(v.startswith(f"UNRESOLVED: Revision 10 P3 'wait >= the hold' {state}"), v)
-            self.assertIn("1.5-1.55 s", v)
-            self.assertIn("1.56-1.6 s", v)
-        for state in ("met", "not met", "undetermined"):
-            self.assertEqual(hv.p3_verdict(False, state, w, a), "FAIL")
+    def test_p3_rev11_pass_when_all_conditions_met(self):
+        v, checks = hv.p3_verdict(dict(self.P3_GOOD))
+        self.assertEqual(v, "PASS")
+        self.assertEqual(len(checks), 9)
+        self.assertTrue(all(checks.values()))
+
+    def test_p3_rev11_fail_when_any_mandatory_condition_fails(self):
+        cases = {"continuous": (False, "same_ingest_waiting_continuously"), "wait_lower": (1.49, "wait_at_least_1_5s"),
+                 "snapshot_ok": (False, "pg_locks_snapshot_a_holds_ingest_waits"),
+                 "l1_above_watermark": (False, "l1_id_above_watermark"), "next_run_reopened_today": (False, "next_run_reopened_today"),
+                 "consistency_ok": (False, "rollup_consistency"), "l1_accepted_once": (False, "l1_accepted_once_http_204")}
+        for key, (bad, check) in cases.items():
+            v, checks = hv.p3_verdict({**self.P3_GOOD, key: bad})
+            self.assertEqual(v, "FAIL: " + check, key)
+            self.assertFalse(checks[check])
+
+    def test_p3_rev11_no_pass_when_session_a_hold_reaches_3s(self):
+        for hold in (3.0, 3.01, 4.2):
+            v, checks = hv.p3_verdict({**self.P3_GOOD, "a_hold_upper": hold})
+            self.assertEqual(v, "FAIL: session_a_total_hold_under_3s", hold)
+        self.assertEqual(hv.p3_verdict({**self.P3_GOOD, "a_hold_upper": 2.999})[0], "PASS")
+
+    def test_p3_rev11_no_pass_when_ingest_wait_reaches_3s(self):
+        for up in (3.0, 3.2):
+            v, _ = hv.p3_verdict({**self.P3_GOOD, "wait_lower": 2.9, "wait_upper": up, "a_hold_upper": 2.95})
+            self.assertEqual(v, "FAIL: wait_under_3s", up)
+        self.assertEqual(hv.p3_verdict({**self.P3_GOOD, "wait_lower": 1.5})[0], "PASS", "exactly 1.5 s observed is enough")
+
+    def test_p3_rev11_inconclusive_cases(self):
+        cases = {"no waiter": ({"waiters": 0}, "not observed waiting"), "competing": ({"waiters": 2}, "more than one session"),
+                 "not identified": ({"identified": False}, "could not be identified"),
+                 "late": ({"hold_outcome": "no identified waiter seen in time"}, "arrived too late"),
+                 "unreliable interval": ({"interval_reliable": False}, "could not be established reliably")}
+        for name, (over, text) in cases.items():
+            v, checks = hv.p3_verdict({**self.P3_GOOD, **over})
+            self.assertTrue(v.startswith("INCONCLUSIVE: ") and text in v, (name, v))
+            self.assertEqual(checks, {})
+        # INCONCLUSIVE is decided before the pass checks: an unreliable interval is never turned into PASS or FAIL
+        self.assertTrue(hv.p3_verdict({**self.P3_GOOD, "interval_reliable": False, "wait_lower": 9})[0].startswith("INCONCLUSIVE"))
+
+    def test_p3_no_revision_10_hold_comparison_left(self):
+        src = open(os.path.join(os.path.dirname(HERE), "hv.py")).read()
+        self.assertNotIn("p3_wait_vs_hold", src)
+        self.assertNotIn("UNRESOLVED", src)
 
     def test_tls_verification_refuses_untrusted_certificate(self):
         d = tempfile.mkdtemp()
@@ -579,8 +610,9 @@ class Integration(unittest.TestCase):
         ctx, st, ev = self.mk("P3")
         v = hv.run_suite(ctx)
         r = ev.doc["results"]["P3"]
-        self.assertEqual(v, "INCONCLUSIVE")
+        self.assertEqual(v, "INCONCLUSIVE: the waiting session could not be identified as analytics_ingest")
         self.assertFalse(r["waiter"]["identified_as_analytics_ingest"])
+        self.assertEqual(r["hold_outcome"], "no identified waiter seen in time", "the 1.5 s never starts on an unidentified waiter")
         self.assertTrue(any("not inferred from http timing" in x.lower() for x in ev.doc["limitations"]))
         self.assertTrue(r["l1_id_above_watermark"] and r["next_run_reopened_today"] and r["consistency"]["ok"])
 
@@ -592,48 +624,42 @@ class Integration(unittest.TestCase):
             r = ev.doc["results"]["P3"]
             w = r["waiter"]
             print("\n    P3 timing:", json.dumps({**w, "session_a_lock_hold_s": r["session_a_lock_hold_s"]}), "verdict", v, file=sys.stderr)
+            self.assertEqual(v, "PASS", json.dumps(r.get("checks")))
+            self.assertTrue(all(r["checks"].values()))
             self.assertEqual(r["hold_outcome"], "held")
             self.assertTrue(w["identified_as_analytics_ingest"], "the waiting session is the ingest (pg_stat_activity)")
-            self.assertTrue(r["pg_locks_snapshot_shows_a_and_ingest"])
+            self.assertTrue(w["observed_waiting_continuously"])
             snap = r["pg_locks_snapshot_during_hold"]
             self.assertIn({"session": "A", "granted": True}, [{k: x[k] for k in ("session", "granted")} for x in snap])
             self.assertTrue(any(x["session"] == "waiter" and x["granted"] is False and x["query_is_ingest"] for x in snap))
-            # L1 is confirmed waiting BEFORE the 1.5 s is measured, and the hold is then demonstrated in full
+            # the identified ingest is confirmed waiting BEFORE the 1.5 s is counted, and A holds at least 1.5 s after that
             tl = r["timeline_ms"]
             self.assertLess(tl["rollup_returned"], tl["first_waiter_seen"])
             self.assertLess(tl["first_waiter_seen"], tl["hold_demonstrated"])
             self.assertLessEqual(tl["hold_demonstrated"], tl["commit"])
             self.assertGreaterEqual(w["hold_demonstrated_s_after_first_wait"], hv.HOLD_S)
-            # wait bounds from pg_locks sample times only
+            # Revision 11: continuous wait >= 1.5 s and < 3 s, from pg_locks sample times only; A's total hold < 3 s
             self.assertGreaterEqual(w["observed_wait_s_lower_bound"], hv.HOLD_S)
             self.assertLess(w["observed_wait_s_upper_bound"], hv.LOCK_TIMEOUT_S)
-            self.assertTrue(r["rule_wait_lt_3s"])
-            # Revision 10 compares the wait with THE HOLD (Session A's lock hold). The ingest starts waiting only after A holds
-            # the lock, so the wait cannot reach the hold: measured, that shows as "not met" or (overlapping bounds) "undetermined"
-            a = r["session_a_lock_hold_s"]
-            self.assertGreaterEqual(a["lower_bound"], hv.HOLD_S)
-            self.assertLess(w["observed_wait_s_lower_bound"], a["upper_bound"], "the wait never reaches A's hold")
-            self.assertIn(r["rule_wait_ge_session_a_hold"], ("not met", "undetermined"))
-            self.assertTrue(r["a_total_hold_under_3s"])
-            self.assertTrue(r["session_a_lock_granted_seen"])
+            self.assertLessEqual(w["max_sample_gap_s"], hv.P3_MAX_SAMPLE_GAP_S)
+            self.assertLess(r["session_a_lock_hold_s"]["upper_bound"], hv.LOCK_TIMEOUT_S)
             self.assertTrue(r["l1_id_above_watermark"])
             self.assertTrue(r["next_run_reopened_today"])
             self.assertTrue(r["consistency"]["ok"])
             self.assertEqual(r["http"]["status"], 204)
             self.assertEqual(r["stats_delta_test"], {"accepted": 1}, "accepted, not busy")
-            self.assertTrue(v.startswith("UNRESOLVED: Revision 10 P3 'wait >= the hold' " + r["rule_wait_ge_session_a_hold"]), v)
-            self.assertNotEqual(v, "PASS")
             self.write_evidence(ev)
         finally:
             self.admin("REVOKE pg_read_all_stats FROM postgres")
 
     def test_p3_request_after_release_is_inconclusive(self):
         ctx, st, ev = self.mk("P3", latency_s=2.0)     # reaches the database after A's waiting window has closed
-        self.assertEqual(hv.run_suite(ctx), "INCONCLUSIVE")
+        v = hv.run_suite(ctx)
         r = ev.doc["results"]["P3"]
-        self.assertEqual(r["hold_outcome"], "no waiter seen in time")
+        self.assertTrue(v.startswith("INCONCLUSIVE: "), v)
+        self.assertEqual(r["hold_outcome"], "no identified waiter seen in time")
         self.assertTrue(r["a_total_hold_under_3s"])
-        self.assertTrue(any("arrived after A committed" in x for x in ev.doc["inconclusive"]))
+        self.assertTrue(any("new run-unique L1" in x for x in ev.doc["inconclusive"]))
 
     def test_p3_competing_waiter_is_inconclusive(self):
         import psycopg
@@ -656,9 +682,8 @@ class Integration(unittest.TestCase):
         try:
             ctx, st, ev = self.mk("P3")
             v = hv.run_suite(ctx)
-            self.assertEqual(v, "INCONCLUSIVE")
+            self.assertEqual(v, "INCONCLUSIVE: more than one session waited on the analytics lock (another traffic source)")
             self.assertGreaterEqual(ev.doc["results"]["P3"]["waiters"], 2)
-            self.assertTrue(any("more than one session waited" in x for x in ev.doc["inconclusive"]))
         finally:
             stop.set()
             th.join(10)

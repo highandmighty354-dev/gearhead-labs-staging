@@ -9,7 +9,8 @@ It is started only by .github/workflows/hosted-verification.yml, in the job that
            D3     probe, decode mode: UTF-8 decoding of the B2-7 / B2-11 byte sequences
            D4     real receiver: the 8,192-byte boundary (B8192, B8193, BLIE, B9000), one evidence window each
            D2     real receiver: 10 MB oversize request O (chunked, slow) and 4,096-byte control C
-           P3     two database sessions: rollup holds the analytics lock 1.5 s while L1 arrives through the receiver
+           P3     two database sessions (revision 11): rollup holds the analytics lock; once L1, sent through the receiver,
+                  is seen waiting on it, the lock is held at least 1.5 s more
            P4     about 20 minutes of paced ingestion (<= 250 events, repeats included) alongside the scheduled rollup
 
 What it never does: insert into an analytics table directly, use a service-role key, read or print a secret,
@@ -53,6 +54,7 @@ ANALYTICS_LOCK_KEY = 7104202611130501            # pg_advisory_xact_lock key in 
 HOLD_S = 1.5                                     # P3: Session A holds the lock this long after the rollup call
 LOCK_TIMEOUT_S = 3.0                             # analytics_ingest() waits at most 3 s, then 'busy'
 P3_MARGIN_S = 0.25                               # P3: room for the confirming sample and COMMIT inside A's 3 s
+P3_MAX_SAMPLE_GAP_S = 0.25                       # P3: a longer gap between pg_locks samples makes the wait interval unreliable
 MAX_BYTES = 8192
 CRON_JOBS = {"analytics-rollup-recent": "*/15 * * * *", "analytics-purge": "17 4 * * *"}
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -1092,16 +1094,17 @@ def suite_p3(ctx):
         wm = sess_a.conn.execute("SELECT max_event_id FROM public.analytics_rollup_runs WHERE day = %s::date AND env = 'test'",
                                  (today,)).fetchone()[0]
         ht.start()
-        # The 1.5 s hold is measured from the first pg_locks sample that shows the ingest WAITING on A's lock, and A commits
-        # only after a sample taken at least 1.5 s later still shows A holding the lock and the same session waiting.
-        # A waiter must appear early enough that A's whole hold (from the rollup call) stays under the 3 s lock wait.
+        # Revision 11 P3: once the monitor observes the IDENTIFIED analytics_ingest session waiting on A's lock, A keeps
+        # holding it for at least 1.5 s from that observation: A commits only after a sample taken >= 1.5 s later still
+        # shows A holding the lock and the same session waiting. The waiter must appear early enough that A's total hold
+        # (from the rollup call) stays under 3 s.
         waiter_deadline = t_marks["rollup_call"] + LOCK_TIMEOUT_S - HOLD_S - P3_MARGIN_S
         k = 0
         while hold["outcome"] is None:
             for tb, ta, snap in samples[k:]:
                 k += 1
                 if hold["first"] is None:
-                    w = waiters(snap)
+                    w = [x for x in waiters(snap) if x[6] is True]      # identified as analytics_ingest
                     if w and a_holds(snap):
                         hold["first"] = (tb, ta, w[0][0])
                         t_marks["first_waiter_seen"] = ta
@@ -1118,7 +1121,7 @@ def suite_p3(ctx):
                     break
             now = time.monotonic()
             if hold["outcome"] is None and hold["first"] is None and now >= waiter_deadline:
-                hold["outcome"] = "no waiter seen in time"
+                hold["outcome"] = "no identified waiter seen in time"
             if hold["outcome"] is None and hold["first"] is not None and now >= hold["first"][1] + LOCK_TIMEOUT_S:
                 hold["outcome"] = "monitor stalled"
             if hold["outcome"] is None:
@@ -1156,8 +1159,8 @@ def suite_p3(ctx):
            "session_a_lock_granted_seen": a_granted, "hold_outcome": hold["outcome"],
            "a_total_hold_s": round(t_marks["released"] - t0, 3),
            "a_total_hold_under_3s": t_marks["released"] - t0 < LOCK_TIMEOUT_S,
-           # How long Session A held the analytics lock: acquired inside analytics_rollup (between the call and its return),
-           # released by COMMIT (between sending it and its return). These are the bounds of "the hold" in Revision 10.
+           # Session A's total lock-hold duration (Revision 11): acquired inside analytics_rollup (between the call and its
+           # return), released by COMMIT (between sending it and its return). The upper bound is what must stay under 3 s.
            "session_a_lock_hold_s": {"lower_bound": round(t_marks["commit"] - t_marks["rollup_returned"], 3),
                                      "upper_bound": round(t_marks["released"] - t_marks["rollup_call"], 3)},
            "http": {k2: rec.get(k2) for k2 in ("status", "error", "ms_to_response")},
@@ -1168,17 +1171,12 @@ def suite_p3(ctx):
         _, _, snap = hold["confirm"]
         res["pg_locks_snapshot_during_hold"] = [{"session": "A" if x[0] == "A" else "waiter", "granted": x[1], "user": x[2],
                                                  "wait": f"{x[4]}/{x[5]}", "query_is_ingest": x[6]} for x in snap]
-    verdict = None
+    obs = {"waiters": len(waiting), "identified": False, "interval_reliable": False, "continuous": False,
+           "wait_lower": None, "wait_upper": None, "snapshot_ok": False, "hold_outcome": hold["outcome"],
+           "a_hold_upper": t_marks["released"] - t_marks["rollup_call"]}
     if len(waiting) > 1:
         res["waiters"] = len(waiting)
-        ev.inconclusive("P3: more than one session waited on the analytics lock - another traffic source.")
-        verdict = "INCONCLUSIVE"
-    elif not waiting or hold["outcome"] == "no waiter seen in time":
-        ev.inconclusive("P3: the ingest was not seen waiting on the analytics lock while A held it (it arrived after A "
-                        "committed, or too late for A's whole hold to stay under 3 s). Inconclusive; repeat with the timing "
-                        "adjusted and a new run-unique L1.")
-        verdict = "INCONCLUSIVE"
-    else:
+    if len(waiting) == 1:
         (pid, w), = waiting.items()
         identified = w["is_ingest"] == {True}
         fi, li = w["first"], w["last"]
@@ -1186,23 +1184,25 @@ def suite_p3(ctx):
         gone_ta = samples[li + 1][1] if li + 1 < len(samples) else None
         lower = samples[li][0] - samples[fi][1]
         upper = (gone_ta - start_floor) if gone_ta is not None else None
+        window = samples[max(fi - 1, 0):li + 2]
+        max_gap = max((b[0] - a[1] for a, b in zip(window, window[1:])), default=0.0)
+        continuous = all(any(x[0] == pid for x in waiters(samples[n][2])) for n in range(fi, li + 1))
         res["waiter"] = {"user": w["user"], "identified_as_analytics_ingest": identified,
                          "observed_wait_s_lower_bound": round(lower, 3),
                          "observed_wait_s_upper_bound": round(upper, 3) if upper is not None else None,
+                         "observed_waiting_continuously": continuous, "samples_while_waiting": li - fi + 1,
+                         "max_sample_gap_s": round(max_gap, 3),
                          "first_wait_seen_ms_after_rollup_call": round((samples[fi][1] - t0) * 1000, 1),
                          "hold_demonstrated_s_after_first_wait": round(t_marks["hold_demonstrated"] - samples[fi][1], 3)
                          if "hold_demonstrated" in t_marks else None,
                          "release_minus_first_wait_s": round(t_marks["released"] - samples[fi][1], 3),
                          "bounds": "from pg_locks sample times only (never from HTTP timing)"}
-        res["pg_locks_snapshot_shows_a_and_ingest"] = bool(hold["confirm"]) and hold["first"][2] == pid
         if not identified:
             ev.limitation("P3: PostgreSQL did not expose enough (query text not visible to this user) to identify the waiting "
                           "session as the ingest; a lock wait is NOT inferred from HTTP timing.")
-            verdict = "INCONCLUSIVE"
-        res["wait_ge_specified_1_5s"] = lower >= HOLD_S          # recorded fact only; not Revision 10's comparison
-        res["rule_wait_lt_3s"] = upper is not None and upper < LOCK_TIMEOUT_S
-        res["rule_wait_ge_session_a_hold"] = p3_wait_vs_hold(lower, upper, t_marks["commit"] - t_marks["rollup_returned"],
-                                                             t_marks["released"] - t_marks["rollup_call"])
+        obs.update({"identified": identified, "continuous": continuous, "wait_lower": lower, "wait_upper": upper,
+                    "interval_reliable": upper is not None and max_gap <= P3_MAX_SAMPLE_GAP_S and hold["outcome"] != "monitor stalled",
+                    "snapshot_ok": bool(hold["confirm"]) and hold["first"][2] == pid})
     l1_id = l1_rows[0]["id"] if len(l1_rows) == 1 else None
     res["l1_id_above_watermark"] = (l1_id is not None and wm is not None and l1_id > int(wm))
     ev.step("database_write", session="main", statement="SELECT public.analytics_rollup_pending")
@@ -1212,45 +1212,49 @@ def suite_p3(ctx):
     res["next_run_reopened_today"] = (int(n_days) >= 1 and l1_id is not None and wm_after is not None and int(wm_after) >= l1_id)
     res["consistency"] = consistency(db, today)
     ev.doc["results"] = {"P3": res}
-    ev.limitation("P3 timing: A commits only after a pg_locks sample at least 1.5 s after the ingest was first seen waiting "
-                  "still shows both. Wait bounds come from pg_locks sample times. Revision 10's rule 'the ingest's wait >= the "
-                  "hold' is compared with Session A's measured lock hold: the ingest can only begin waiting after A holds the "
-                  "lock and stops when A commits, so its wait is shorter than A's hold and the rule cannot be met literally "
-                  "(owner decision; reported as UNRESOLVED, never PASS).")
+    ev.limitation("P3 follows Revision 11 (SHA-256 bad6ef57...ad6f): A keeps the lock for at least 1.5 s after the identified "
+                  "ingest is first seen waiting; the wait's bounds come from pg_locks sample times, so their precision is the "
+                  "sampling interval plus one monitor query (a gap over 0.25 s makes the interval unreliable: INCONCLUSIVE).")
     for c in (sess_a, mon):
         try:
             c.conn.close()
         except Exception:
             pass
-    if verdict:
-        return verdict
-    others_ok = (res["rule_wait_lt_3s"] and res["pg_locks_snapshot_shows_a_and_ingest"] and res["a_total_hold_under_3s"]
-                 and hold["outcome"] == "held" and res["l1_id_above_watermark"] and res["next_run_reopened_today"]
-                 and res["consistency"]["ok"] and a_granted and rec.get("status") == 204 and delta_t == {"accepted": 1})
-    return p3_verdict(others_ok, res["rule_wait_ge_session_a_hold"], res["waiter"], res["session_a_lock_hold_s"])
+    obs.update({"l1_above_watermark": res["l1_id_above_watermark"], "next_run_reopened_today": res["next_run_reopened_today"],
+                "consistency_ok": res["consistency"]["ok"],
+                "l1_accepted_once": rec.get("status") == 204 and delta_t == {"accepted": 1} and len(l1_rows) == 1 and a_granted})
+    verdict, checks = p3_verdict(obs)
+    res["checks"] = checks
+    if verdict.startswith("INCONCLUSIVE"):
+        ev.inconclusive("P3: " + verdict[len("INCONCLUSIVE: "):] + ". Repeat only with a new run-unique L1.")
+    return verdict
 
 
-def p3_wait_vs_hold(wait_lower, wait_upper, hold_lower, hold_upper):
-    """Revision 10 P3: 'the ingest's wait >= the hold', where the hold is how long Session A held the lock.
-    'met' only if the wait's lower bound reaches the hold's upper bound; 'not met' if the wait's upper bound is below the
-    hold's lower bound; otherwise the measurement cannot decide."""
-    if wait_upper is None:
-        return "undetermined"
-    if wait_lower >= hold_upper:
-        return "met"
-    if wait_upper < hold_lower:
-        return "not met"
-    return "undetermined"
-
-
-def p3_verdict(others_ok, wait_vs_hold, waiter, a_hold):
-    if not others_ok:
-        return "FAIL"
-    if wait_vs_hold == "met":
-        return "PASS"
-    return (f"UNRESOLVED: Revision 10 P3 'wait >= the hold' {wait_vs_hold} - ingest wait "
-            f"{waiter['observed_wait_s_lower_bound']}-{waiter['observed_wait_s_upper_bound']} s, Session A lock hold "
-            f"{a_hold['lower_bound']}-{a_hold['upper_bound']} s (all other P3 checks passed; owner decision needed)")
+def p3_verdict(o):
+    """Revision 11 P3 decision, from observations only. Returns (verdict, checks)."""
+    if o["waiters"] > 1:
+        return "INCONCLUSIVE: more than one session waited on the analytics lock (another traffic source)", {}
+    if o["waiters"] == 0:
+        return "INCONCLUSIVE: the ingest was not observed waiting on the analytics lock (it arrived after A committed)", {}
+    if not o["identified"]:
+        return "INCONCLUSIVE: the waiting session could not be identified as analytics_ingest", {}
+    if o["hold_outcome"] == "no identified waiter seen in time":
+        return "INCONCLUSIVE: the identified ingest was observed waiting only after A's waiting window closed (arrived too late)", {}
+    if not o["interval_reliable"]:
+        return "INCONCLUSIVE: the waiting interval could not be established reliably from the pg_locks samples", {}
+    checks = {
+        "same_ingest_waiting_continuously": bool(o["continuous"]),
+        "wait_at_least_1_5s": o["wait_lower"] >= HOLD_S,
+        "wait_under_3s": o["wait_upper"] < LOCK_TIMEOUT_S,
+        "pg_locks_snapshot_a_holds_ingest_waits": bool(o["snapshot_ok"]),
+        "session_a_total_hold_under_3s": o["a_hold_upper"] < LOCK_TIMEOUT_S,
+        "l1_id_above_watermark": bool(o["l1_above_watermark"]),
+        "next_run_reopened_today": bool(o["next_run_reopened_today"]),
+        "rollup_consistency": bool(o["consistency_ok"]),
+        "l1_accepted_once_http_204": bool(o["l1_accepted_once"]),
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    return ("PASS" if not failed else "FAIL: " + ", ".join(failed)), checks
 
 
 def consistency(db, today):
