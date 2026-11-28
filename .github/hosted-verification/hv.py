@@ -52,6 +52,7 @@ EXPECTED_PUBLIC_TABLES = 32
 ANALYTICS_LOCK_KEY = 7104202611130501            # pg_advisory_xact_lock key in 0501 (analytics write lock)
 HOLD_S = 1.5                                     # P3: Session A holds the lock this long after the rollup call
 LOCK_TIMEOUT_S = 3.0                             # analytics_ingest() waits at most 3 s, then 'busy'
+P3_MARGIN_S = 0.25                               # P3: room for the confirming sample and COMMIT inside A's 3 s
 MAX_BYTES = 8192
 CRON_JOBS = {"analytics-rollup-recent": "*/15 * * * *", "analytics-purge": "17 4 * * *"}
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -947,10 +948,9 @@ def suite_d4(ctx):
             else:
                 ev.inconclusive("D4: B8192 did not behave as expected - remaining D4 requests were not sent.")
             break
-    ev.limitation("D4 BLIE: over HTTP/1.1 a Content-Length of 100 tells every hop the body is 100 bytes, so the remaining "
-                  "20,380 bytes arrive as if they were a second, malformed request. A server or proxy may answer that with an "
-                  "error (locally, Node's HTTP server answered 400 while the function still counted bad_batch +1). The status "
-                  "is reported as observed and compared with Revision 10's 204 literally.")
+    ev.limitation("D4 BLIE: over HTTP/1.1 the bytes after Content-Length 100 are not part of the request; a server sees "
+                  "them as a malformed second message and may answer it with an error before or instead of the function's "
+                  "204 (Node's default does). The first status received is reported and compared with 204 literally.")
     ev.doc["results"] = {"D4": {"requests": results, "net_change": net,
                                 "expected_net_change": {"events": 1, "bad_batch": 2}}}
     done = [w["result"] for w in results]
@@ -1047,7 +1047,7 @@ def suite_p3(ctx):
     def monitor():
         last = None
         while not stop.is_set():
-            t = time.monotonic()
+            tb = time.monotonic()
             rows = mon.conn.execute(
                 """SELECT l.pid, l.granted, a.usename, a.backend_type, a.wait_event_type, a.wait_event,
                           CASE WHEN a.query IS NULL OR a.query LIKE '<insufficient%%' THEN NULL
@@ -1056,34 +1056,73 @@ def suite_p3(ctx):
                    WHERE l.locktype = 'advisory' AND l.classid = %s AND l.objid = %s AND l.objsubid = 1
                      AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
                    ORDER BY l.granted DESC, l.pid""", (hi, lo)).fetchall()
+            ta = time.monotonic()
             snap = tuple(("A" if r[0] == a_pid else f"other-{r[0]}", r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows)
-            samples.append((t, snap))
+            samples.append((tb, ta, snap))     # the snapshot shows the state at some instant between tb and ta
             if snap != last:
-                ev.clog("P3", "pg_locks", t=round(t, 3),
+                ev.clog("P3", "pg_locks", t_before=round(tb, 3), t_after=round(ta, 3),
                         holders=[{"session": s[0].split("-")[0] if s[0] != "A" else "A", "granted": s[1], "user": s[2],
                                   "backend_type": s[3], "wait": f"{s[4]}/{s[5]}", "query_is_ingest": s[6]} for s in snap])
                 last = snap
-            time.sleep(0.025)
+            time.sleep(0.02)
 
     def send_l1():
+        t_marks["l1_sent"] = time.monotonic()
         http_box["rec"] = http_request(ctx.target, ev, "P3-L1", "POST", ctx.target.receiver_path(),
                                        std_headers(ctx.origin, ctx.run_id), body, mode="length")
         http_box["t_done"] = time.monotonic()
 
+    def a_holds(snap):
+        return any(x[0] == "A" and x[1] is True for x in snap)
+
+    def waiters(snap):
+        return [x for x in snap if x[0] != "A" and x[1] is False]
+
     mt = threading.Thread(target=monitor, daemon=True)
     mt.start()
     ht = threading.Thread(target=send_l1, daemon=True)
+    hold = {"outcome": None, "first": None, "confirm": None}
     try:
         sess_a.conn.execute("BEGIN")
         sess_a.conn.execute("SET LOCAL statement_timeout = '15s'")
         t_marks["rollup_call"] = time.monotonic()
         ev.step("database_write", session="A", statement="SELECT public.analytics_rollup")
         sess_a.conn.execute("SELECT public.analytics_rollup(%s::date)", (today,))
-        t_marks["hold_start"] = time.monotonic()
+        t_marks["rollup_returned"] = time.monotonic()
         wm = sess_a.conn.execute("SELECT max_event_id FROM public.analytics_rollup_runs WHERE day = %s::date AND env = 'test'",
                                  (today,)).fetchone()[0]
         ht.start()
-        time.sleep(max(0.0, HOLD_S - (time.monotonic() - t_marks["hold_start"])))
+        # The 1.5 s hold is measured from the first pg_locks sample that shows the ingest WAITING on A's lock, and A commits
+        # only after a sample taken at least 1.5 s later still shows A holding the lock and the same session waiting.
+        # A waiter must appear early enough that A's whole hold (from the rollup call) stays under the 3 s lock wait.
+        waiter_deadline = t_marks["rollup_call"] + LOCK_TIMEOUT_S - HOLD_S - P3_MARGIN_S
+        k = 0
+        while hold["outcome"] is None:
+            for tb, ta, snap in samples[k:]:
+                k += 1
+                if hold["first"] is None:
+                    w = waiters(snap)
+                    if w and a_holds(snap):
+                        hold["first"] = (tb, ta, w[0][0])
+                        t_marks["first_waiter_seen"] = ta
+                    continue
+                f_ta, f_pid = hold["first"][1], hold["first"][2]
+                still = a_holds(snap) and any(x[0] == f_pid for x in waiters(snap))
+                if not still:
+                    hold["outcome"] = "waiter left before the hold was demonstrated"
+                    break
+                if tb >= f_ta + HOLD_S:
+                    hold["confirm"] = (tb, ta, snap)
+                    hold["outcome"] = "held"
+                    t_marks["hold_demonstrated"] = ta
+                    break
+            now = time.monotonic()
+            if hold["outcome"] is None and hold["first"] is None and now >= waiter_deadline:
+                hold["outcome"] = "no waiter seen in time"
+            if hold["outcome"] is None and hold["first"] is not None and now >= hold["first"][1] + LOCK_TIMEOUT_S:
+                hold["outcome"] = "monitor stalled"
+            if hold["outcome"] is None:
+                time.sleep(0.005)
         t_marks["commit"] = time.monotonic()
         sess_a.conn.execute("COMMIT")
         t_marks["released"] = time.monotonic()
@@ -1104,45 +1143,59 @@ def suite_p3(ctx):
     l1_rows = snap_events(db, [l1]).get(l1, [])
     after_stats = snap_stats(db)
     delta_t, other_env = delta_test_only(stats_delta(before_stats, after_stats))
-    # waiting sessions: any session other than A seen with granted = false on the analytics lock
+    # every session other than A seen waiting (granted = false) on the analytics lock, with its sample indexes
     waiting = {}
-    for t, snap in samples:
-        for s in snap:
-            if s[0] != "A" and s[1] is False:
-                w = waiting.setdefault(s[0], {"first": t, "last": t, "is_ingest": set(), "user": s[2]})
-                w["last"] = t
-                w["is_ingest"].add(s[6])
-    a_granted = any(s[0] == "A" and s[1] for _, snap in samples for s in snap)
+    for n, (tb, ta, snap) in enumerate(samples):
+        for x in waiters(snap):
+            w = waiting.setdefault(x[0], {"first": n, "last": n, "is_ingest": set(), "user": x[2]})
+            w["last"] = n
+            w["is_ingest"].add(x[6])
+    a_granted = any(a_holds(snap) for _, _, snap in samples)
+    t0 = t_marks["rollup_call"]
     res = {"today": today, "hold_s": HOLD_S, "session_a_watermark": int(wm) if wm is not None else None,
-           "session_a_lock_granted_seen": a_granted, "http": {k: rec.get(k) for k in ("status", "error", "ms_to_response")},
+           "session_a_lock_granted_seen": a_granted, "hold_outcome": hold["outcome"],
+           "a_total_hold_s": round(t_marks["released"] - t0, 3),
+           "a_total_hold_under_3s": t_marks["released"] - t0 < LOCK_TIMEOUT_S,
+           "http": {k2: rec.get(k2) for k2 in ("status", "error", "ms_to_response")},
            "l1_rows": l1_rows, "stats_delta_test": delta_t, "other_env_changed": other_env,
-           "timeline_ms": {k: round((v - t_marks["rollup_call"]) * 1000, 1) for k, v in t_marks.items()},
+           "timeline_ms": {k2: round((v - t0) * 1000, 1) for k2, v in t_marks.items()},
            "monitor_samples": len(samples)}
+    if hold["confirm"]:
+        _, _, snap = hold["confirm"]
+        res["pg_locks_snapshot_during_hold"] = [{"session": "A" if x[0] == "A" else "waiter", "granted": x[1], "user": x[2],
+                                                 "wait": f"{x[4]}/{x[5]}", "query_is_ingest": x[6]} for x in snap]
     verdict = None
     if len(waiting) > 1:
         res["waiters"] = len(waiting)
         ev.inconclusive("P3: more than one session waited on the analytics lock - another traffic source.")
         verdict = "INCONCLUSIVE"
-    elif not waiting:
-        ev.inconclusive("P3: no session was seen waiting on the analytics lock during the hold: the request arrived after "
-                        "the lock was released (or was not seen). Inconclusive; repeat with a new run (new L1).")
+    elif not waiting or hold["outcome"] == "no waiter seen in time":
+        ev.inconclusive("P3: the ingest was not seen waiting on the analytics lock while A held it (it arrived after A "
+                        "committed, or too late for A's whole hold to stay under 3 s). Inconclusive; repeat with the timing "
+                        "adjusted and a new run-unique L1.")
         verdict = "INCONCLUSIVE"
     else:
-        (_, w), = waiting.items()
-        poll_gap = 0.06
-        lower = w["last"] - w["first"]
-        upper = (w["last"] - w["first"]) + 2 * poll_gap
-        released_after_first_wait = t_marks["released"] - w["first"]
+        (pid, w), = waiting.items()
         identified = w["is_ingest"] == {True}
+        fi, li = w["first"], w["last"]
+        start_floor = max(samples[fi - 1][0] if fi > 0 else t_marks["l1_sent"], t_marks["l1_sent"])
+        gone_ta = samples[li + 1][1] if li + 1 < len(samples) else None
+        lower = samples[li][0] - samples[fi][1]
+        upper = (gone_ta - start_floor) if gone_ta is not None else None
         res["waiter"] = {"user": w["user"], "identified_as_analytics_ingest": identified,
-                         "observed_wait_s_lower_bound": round(lower, 3), "observed_wait_s_upper_bound": round(upper, 3),
-                         "a_release_minus_first_wait_seen_s": round(released_after_first_wait, 3),
-                         "first_wait_seen_ms_after_hold_start": round((w["first"] - t_marks["hold_start"]) * 1000, 1)}
+                         "observed_wait_s_lower_bound": round(lower, 3),
+                         "observed_wait_s_upper_bound": round(upper, 3) if upper is not None else None,
+                         "first_wait_seen_ms_after_rollup_call": round((samples[fi][1] - t0) * 1000, 1),
+                         "hold_demonstrated_s_after_first_wait": round(t_marks["hold_demonstrated"] - samples[fi][1], 3)
+                         if "hold_demonstrated" in t_marks else None,
+                         "release_minus_first_wait_s": round(t_marks["released"] - samples[fi][1], 3),
+                         "bounds": "from pg_locks sample times only (never from HTTP timing)"}
+        res["pg_locks_snapshot_shows_a_and_ingest"] = bool(hold["confirm"]) and hold["first"][2] == pid
         if not identified:
             ev.limitation("P3: PostgreSQL did not expose enough (query text not visible to this user) to identify the waiting "
                           "session as the ingest; a lock wait is NOT inferred from HTTP timing.")
             verdict = "INCONCLUSIVE"
-        res["rule_wait_ge_hold_and_lt_3s"] = lower >= HOLD_S and upper < LOCK_TIMEOUT_S
+        res["rule_wait_ge_hold_and_lt_3s"] = upper is not None and lower >= HOLD_S and upper < LOCK_TIMEOUT_S
     l1_id = l1_rows[0]["id"] if len(l1_rows) == 1 else None
     res["l1_id_above_watermark"] = (l1_id is not None and wm is not None and l1_id > int(wm))
     ev.step("database_write", session="main", statement="SELECT public.analytics_rollup_pending")
@@ -1152,9 +1205,9 @@ def suite_p3(ctx):
     res["next_run_reopened_today"] = (int(n_days) >= 1 and l1_id is not None and wm_after is not None and int(wm_after) >= l1_id)
     res["consistency"] = consistency(db, today)
     ev.doc["results"] = {"P3": res}
-    ev.limitation("P3 timing: L1 is sent when the 1.5 s hold starts, so the ingest can only begin waiting after the network "
-                  "and platform delay; its wait is then shorter than the hold. Revision 10's rule 'wait >= hold' is applied "
-                  "literally and may not be reachable this way (owner decision; not reinterpreted here).")
+    ev.limitation("P3 timing: the 1.5 s hold is counted from the first pg_locks sample showing the ingest waiting on A's lock; "
+                  "A commits only after a sample at least 1.5 s later still shows both. Wait bounds come from pg_locks sample "
+                  "times; their precision is the sampling interval plus one monitor query.")
     for c in (sess_a, mon):
         try:
             c.conn.close()
@@ -1162,7 +1215,8 @@ def suite_p3(ctx):
             pass
     if verdict:
         return verdict
-    ok = (res["rule_wait_ge_hold_and_lt_3s"] and res["l1_id_above_watermark"] and res["next_run_reopened_today"]
+    ok = (res["rule_wait_ge_hold_and_lt_3s"] and res["pg_locks_snapshot_shows_a_and_ingest"] and res["a_total_hold_under_3s"]
+          and hold["outcome"] == "held" and res["l1_id_above_watermark"] and res["next_run_reopened_today"]
           and res["consistency"]["ok"] and a_granted and rec.get("status") == 204 and delta_t == {"accepted": 1})
     return "PASS" if ok else "FAIL"
 

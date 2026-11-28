@@ -111,18 +111,24 @@ contract is an A4 assumption for the owner to confirm in A9.**
 
 ## Known limitations (also written into every evidence file that they affect)
 
-- **P3 timing:** Revision 10's rule is literally "wait ≥ hold (1.5 s) and < 3 s". L1 is sent when the hold starts, so
-  the ingest starts waiting only after the network and platform delay, and its wait is shorter than the hold.
-  - Locally (about 20–40 ms delay) the measured wait was 1.461–1.581 s, so the literal rule reports FAIL even though
-    the lock behaved correctly.
-  - This is implemented literally and not reinterpreted. It needs an owner decision before A10.
+- **P3 timing:** the 1.5 s hold is counted from the first `pg_locks` sample that shows the ingest waiting on Session A's
+  lock. A commits only after a sample taken at least 1.5 s later still shows A holding the lock and the same session
+  waiting.
+  - The wait's bounds come from `pg_locks` sample times only, never from HTTP timing.
+  - If no waiter is seen within 1.25 s of the rollup call, A commits and P3 is INCONCLUSIVE ("arrives after A
+    commits"). This keeps A's whole hold under the 3 s lock wait; the total hold is recorded and checked.
+  - Locally the wait measured 1.504–1.562 s, and A's whole hold 1.59–1.61 s. Revision 10's rule (wait ≥ 1.5 s and
+    < 3 s) was met literally.
 - **P3 identification:** this needs the database user to see other sessions' query text. Without it, P3 is
   INCONCLUSIVE; a lock wait is never inferred from HTTP timing.
-- **D4 BLIE:** over HTTP/1.1, `Content-Length: 100` followed by 20 KB makes the extra bytes look like a second,
-  malformed request.
-  - Locally, the unmodified receiver behind Node's HTTP server still counted `bad_batch` +1, but the client saw
-    **HTTP 400**, not 204.
-  - The status is reported literally, so D4 then reports `FAIL: BLIE (HTTP status 400 …)`. Owner decision.
+- **D4 BLIE:** over HTTP/1.1, the bytes after `Content-Length: 100` are not part of the request; a server sees them as
+  a malformed second message.
+  - Node's HTTP server answers that with its own `400 Bad Request` by default, and drops the receiver's 204 still in
+    progress. That was the cause of the earlier local 400.
+  - The local harness (`tests/real_receiver.mjs`) now lets the receiver's answer go out first, then closes the
+    connection, and logs the parse error. The unmodified receiver answers 204, with `bad_batch` +1 and no row.
+  - How the hosted platform treats the trailing bytes is unknown until A10. Its status is reported literally, and
+    400 is never accepted.
 - **D4 B9000:** this workflow cannot read Edge Function logs. D4 is therefore reported as "NOT FULLY PASSED … B9000
   function-log evidence unavailable" at best.
 - **D2:** cancellation is **not verifiable on the hosted platform** (Revision 10). The function logs for the O and C

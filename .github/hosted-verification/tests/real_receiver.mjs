@@ -37,4 +37,14 @@ const srv = http.createServer(async (req, res) => {
   res.writeHead(r.status, Object.fromEntries(r.headers));
   res.end(() => { if (hasBody) req.destroy(); });   // after the answer is sent, an unread remainder is abandoned
 });
+// Bytes after a message's declared Content-Length are not part of that message (HTTP/1.1); Node's parser reports them as a
+// client error, and by DEFAULT answers "400 Bad Request" and destroys the socket at once - which discards the receiver's own
+// answer to the request still being handled (D4 BLIE: Content-Length 100 + 20 KB). This handler lets that in-flight answer go
+// out first, then closes the connection without answering the trailing bytes, and logs the parse error so it is never hidden.
+srv.on('clientError', (err, socket) => {
+  const res = socket._httpMessage;     // the ServerResponse of the request this connection is still answering, if any
+  console.log(`CLIENT_ERROR ${err.code} bytesParsed=${err.bytesParsed} inflight=${Boolean(res && !res.headersSent)}`);
+  if (res && !res.headersSent) { res.on('finish', () => socket.destroy()); return; }
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); else socket.destroy();
+});
 srv.listen(0, '127.0.0.1', () => console.log('PORT ' + srv.address().port));

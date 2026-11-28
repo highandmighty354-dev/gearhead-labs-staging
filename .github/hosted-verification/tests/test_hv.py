@@ -572,26 +572,72 @@ class Integration(unittest.TestCase):
             ctx, st, ev = self.mk("P3")
             v = hv.run_suite(ctx)
             r = ev.doc["results"]["P3"]
-            self.assertTrue(r["waiter"]["identified_as_analytics_ingest"])
+            w = r["waiter"]
+            print("\n    P3 timing:", json.dumps({**w, "a_total_hold_s": r["a_total_hold_s"]}), "verdict", v, file=sys.stderr)
+            self.assertEqual(r["hold_outcome"], "held")
+            self.assertTrue(w["identified_as_analytics_ingest"], "the waiting session is the ingest (pg_stat_activity)")
+            self.assertTrue(r["pg_locks_snapshot_shows_a_and_ingest"])
+            snap = r["pg_locks_snapshot_during_hold"]
+            self.assertIn({"session": "A", "granted": True}, [{k: x[k] for k in ("session", "granted")} for x in snap])
+            self.assertTrue(any(x["session"] == "waiter" and x["granted"] is False and x["query_is_ingest"] for x in snap))
+            # L1 is confirmed waiting BEFORE the 1.5 s is measured, and the hold is then demonstrated in full
+            tl = r["timeline_ms"]
+            self.assertLess(tl["rollup_returned"], tl["first_waiter_seen"])
+            self.assertLess(tl["first_waiter_seen"], tl["hold_demonstrated"])
+            self.assertLessEqual(tl["hold_demonstrated"], tl["commit"])
+            self.assertGreaterEqual(w["hold_demonstrated_s_after_first_wait"], hv.HOLD_S)
+            # the literal Revision 10 rule, from pg_locks sample times only
+            self.assertGreaterEqual(w["observed_wait_s_lower_bound"], hv.HOLD_S)
+            self.assertLess(w["observed_wait_s_upper_bound"], hv.LOCK_TIMEOUT_S)
+            self.assertTrue(r["rule_wait_ge_hold_and_lt_3s"])
+            self.assertTrue(r["a_total_hold_under_3s"])
             self.assertTrue(r["session_a_lock_granted_seen"])
             self.assertTrue(r["l1_id_above_watermark"])
             self.assertTrue(r["next_run_reopened_today"])
             self.assertTrue(r["consistency"]["ok"])
-            self.assertEqual(r["stats_delta_test"], {"accepted": 1})
-            self.assertGreater(r["waiter"]["observed_wait_s_lower_bound"], 1.0)
-            self.assertLess(r["waiter"]["observed_wait_s_upper_bound"], 3.0)
-            # The literal rule (wait >= 1.5 s hold) decides the verdict; it is reported, not adjusted.
-            self.assertEqual(v, "PASS" if r["rule_wait_ge_hold_and_lt_3s"] else "FAIL")
-            self.p3_local = r["waiter"]
-            print("\n    P3 local timing:", json.dumps(r["waiter"]), "verdict", v, file=sys.stderr)
+            self.assertEqual(r["http"]["status"], 204)
+            self.assertEqual(r["stats_delta_test"], {"accepted": 1}, "accepted, not busy")
+            self.assertEqual(v, "PASS")
             self.write_evidence(ev)
         finally:
             self.admin("REVOKE pg_read_all_stats FROM postgres")
 
     def test_p3_request_after_release_is_inconclusive(self):
-        ctx, st, ev = self.mk("P3", latency_s=2.0)
+        ctx, st, ev = self.mk("P3", latency_s=2.0)     # reaches the database after A's waiting window has closed
         self.assertEqual(hv.run_suite(ctx), "INCONCLUSIVE")
-        self.assertTrue(any("after the lock was released" in x for x in ev.doc["inconclusive"]))
+        r = ev.doc["results"]["P3"]
+        self.assertEqual(r["hold_outcome"], "no waiter seen in time")
+        self.assertTrue(r["a_total_hold_under_3s"])
+        self.assertTrue(any("arrived after A committed" in x for x in ev.doc["inconclusive"]))
+
+    def test_p3_competing_waiter_is_inconclusive(self):
+        import psycopg
+        self.admin("GRANT pg_read_all_stats TO postgres")
+        stop = threading.Event()
+
+        def competitor():
+            with psycopg.connect(PG_ADMIN, autocommit=True, application_name="competing-waiter") as c:
+                while not stop.is_set():          # wait until A holds the analytics lock, then queue for it too
+                    if c.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objid = %s",
+                                 (hv.lock_parts(hv.ANALYTICS_LOCK_KEY)[1],)).fetchone()[0]:
+                        break
+                    time.sleep(0.005)
+                c.execute("BEGIN")
+                c.execute("SET LOCAL lock_timeout = '5s'")
+                c.execute("SELECT pg_advisory_xact_lock(%s)", (hv.ANALYTICS_LOCK_KEY,))
+                c.execute("COMMIT")
+        th = threading.Thread(target=competitor, daemon=True)
+        th.start()
+        try:
+            ctx, st, ev = self.mk("P3")
+            v = hv.run_suite(ctx)
+            self.assertEqual(v, "INCONCLUSIVE")
+            self.assertGreaterEqual(ev.doc["results"]["P3"]["waiters"], 2)
+            self.assertTrue(any("more than one session waited" in x for x in ev.doc["inconclusive"]))
+        finally:
+            stop.set()
+            th.join(10)
+            self.admin("REVOKE pg_read_all_stats FROM postgres")
 
     def _p4(self, simulate_cron):
         import psycopg
@@ -645,6 +691,7 @@ class RealReceiver(Integration):
         p = subprocess.Popen(["node", os.path.join(HERE, "real_receiver.mjs"), REAL_JS, PG_ADMIN, ORIGIN], stdout=subprocess.PIPE,
                              text=True, env={**os.environ, "RR_ENABLED": "true" if enabled else "false"})
         self.addCleanup(p.kill)
+        self.rr_proc = p
         line = p.stdout.readline().strip()
         self.assertTrue(line.startswith("PORT "), line)
         run_id = next_run_id()
@@ -659,17 +706,23 @@ class RealReceiver(Integration):
         ctx, _, ev = self.mk("D4")
         v = hv.run_suite(ctx)
         rs = {w["request"]: w for w in ev.doc["results"]["D4"]["requests"]}
-        for r in ("B8192", "B8193", "B9000"):
+        for r in ("B8192", "B8193", "BLIE", "B9000"):
             self.assertEqual(rs[r]["result"], "as expected", r)
-        self.assertEqual(rs["BLIE"]["stats_delta_test"], {"rejected:bad_batch": 1}, "the function still judged BLIE")
+            self.assertEqual(rs[r]["http"]["status"], 204, r)
+        self.assertEqual(rs["BLIE"]["http"]["content_length_sent"], 100)
+        self.assertEqual(rs["BLIE"]["body_bytes"], 20480)
+        self.assertEqual(rs["BLIE"]["stats_delta_test"], {"rejected:bad_batch": 1})
+        self.assertEqual(sum(len(x) for x in rs["BLIE"]["after"]["rows"].values()), 0, "no BLIE row")
+        self.assertEqual(rs["B8192"]["stats_delta_test"], {"accepted": 1})
+        self.assertEqual(rs["B8193"]["stats_delta_test"], {"rejected:bad_batch": 1})
+        self.assertEqual(rs["B9000"]["stats_delta_test"], {})
         self.assertEqual(ev.doc["results"]["D4"]["net_change"], {"events": 1, "bad_batch": 2})
-        st = rs["BLIE"]["http"]["status"]
-        print(f"\n    BLIE on the real handler behind Node's HTTP server: HTTP {st}; verdict: {v}", file=sys.stderr)
-        if st == 204:
-            self.assertEqual(v, "NOT FULLY PASSED: all four as expected; B9000 function-log evidence unavailable")
-        else:   # reported literally, never converted into a pass
-            self.assertEqual(rs["BLIE"]["result"], f"differs from Revision 10: HTTP status {st} instead of 204 (database result as expected)")
-            self.assertEqual(v, f"FAIL: BLIE (HTTP status {st} instead of 204 (database result as expected))")
+        self.assertEqual(v, "NOT FULLY PASSED: all four as expected; B9000 function-log evidence unavailable")
+        # the trailing 20,380 bytes still produced a parse error in the harness: logged, and answered only after the 204
+        self.rr_proc.kill()
+        log = self.rr_proc.stdout.read()
+        self.assertIn("CLIENT_ERROR HPE_CLOSED_CONNECTION bytesParsed=", log)
+        self.assertIn("inflight=true", log)
 
     def test_d4_window_closed(self):
         ctx, _, ev = self.mk("D4", enabled=False)
