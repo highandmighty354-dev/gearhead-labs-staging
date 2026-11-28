@@ -144,22 +144,26 @@ Each step is a separate approval (section 7). Nothing happens before the earlier
 - **Any other level is reported as a finding, not assumed safe.**
 - **Limitation:** this shows the default, not the level a running cron job or API call actually used. Proving that needs a write (a temporary job or function), and isn't proposed.
 
-**P3 — Lock wait (C2-1 and C2-9 on hosted)**
+P3 — Lock wait (C2-1 and C2-9 on hosted)
+
 It needs two sessions, run by the staging workflow:
+
 1. Session A (as postgres) begins, calls analytics_rollup(today), and holds the advisory lock.
 2. During the hold, one valid TEST batch (event L1, run-unique) is ingested through the real receiver.
 3. Once the monitor observes the identified analytics_ingest session waiting on Session A’s advisory lock, Session A continues holding the lock for at least 1.5 seconds from that observation.
 4. Session A then commits. Its total lock-hold duration, measured from lock acquisition through release, must remain under 3 seconds.
 5. Then analytics_rollup_pending() runs.
 
-- Pass:
-  - the same identified ingest session is observed waiting continuously on the advisory lock for at least 1.5 seconds and less than 3 seconds;
-  - a pg_locks snapshot shows Session A holding the advisory lock and the identified ingest waiting on it;
-  - Session A’s total lock-hold duration is under 3 seconds;
-  - L1’s id is above the watermark A recorded;
-  - the next run reopens today;
-  - afterwards, today’s rolled-up page views equal raw page views, and no day holds an event above its watermark.
-- Inconclusive: if the ingest arrives after A commits, or the identified waiting session cannot be observed, report the reason. Repeat only with a new run-unique L1.
+* Pass:
+    * the same identified ingest session is observed waiting continuously on the advisory lock for at least 1.5 seconds and less than 3 seconds;
+    * a pg_locks snapshot shows Session A holding the advisory lock and the identified ingest waiting on it;
+    * Session A’s total lock-hold duration is under 3 seconds;
+    * L1’s id is above the watermark A recorded;
+    * the next run reopens today;
+    * afterwards, today’s rolled-up page views equal raw page views, and no day holds an event above its watermark.
+* Inconclusive: if the ingest arrives after A commits, or the identified waiting session cannot be observed, report the reason. Repeat only with a new run-unique L1.
+
+All other P3 requirements and safeguards remain unchanged.
 
 **P4 — Concurrent ingest and rollup through the API**
 - **Steps:**
