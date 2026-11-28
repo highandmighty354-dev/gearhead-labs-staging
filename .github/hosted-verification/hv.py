@@ -834,7 +834,7 @@ def suite_d1(ctx):
         ev.inconclusive("D1: the platform refused or failed some requests before the probe answered, so their chunk sizes "
                         "were not observed (recorded per case): " + ", ".join(rejected))
         return "INCONCLUSIVE: chunk sizes not observed for " + ", ".join(rejected)
-    return "PASS (observations recorded)"
+    return "PASS"     # every case observed; the observations are in the evidence (results.D1.cases)
 
 
 def d3_cases(ctx):

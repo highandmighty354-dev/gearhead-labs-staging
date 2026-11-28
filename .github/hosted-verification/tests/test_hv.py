@@ -336,9 +336,47 @@ class ProbeVerdicts(unittest.TestCase):
         self.assertEqual(v, "INCONCLUSIVE: chunk sizes not observed for " + ", ".join(rejected))
         self.assertTrue(any("not observed" in x for x in ev.doc["inconclusive"]))
 
-    def test_d1_without_rejection_still_passes(self):
-        v, _ = self.run_probe_suite("D1")
-        self.assertEqual(v, "PASS (observations recorded)")
+    def test_d1_clean_run_returns_exact_pass(self):
+        v, ev = self.run_probe_suite("D1")
+        self.assertEqual(v, "PASS", "exactly PASS, the only verdict main() treats as success")
+        cases = ev.doc["results"]["D1"]["cases"]
+        self.assertEqual(len(cases), 15)
+        self.assertTrue(all("chunks" in c and c["total_equals_sent"] for c in cases), "every observation kept")
+        self.assertIsNotNone(ev.doc["results"]["D1"]["largest_chunk_delivered_for_bodies_over_8192"])
+        self.assertEqual(ev.doc["inconclusive"], [])
+
+    def _main_with_real_d1(self, **standin_kw):
+        """main() with every safeguard as usual; only the network target is swapped for the local stand-in and the
+        database identity step is skipped (D1 does not use the database). The real D1 logic decides the verdict."""
+        st = standin.StandIn(origin=ORIGIN, **standin_kw)
+        self.addCleanup(st.close)
+        orig = (hv.run_suite, hv.connect, hv.assert_tls)
+
+        def run_suite(ctx):
+            ctx.target, ctx.db = hv.Target("http", "127.0.0.1", st.port), None
+            return orig[0](ctx)
+        hv.run_suite, hv.connect, hv.assert_tls = run_suite, (lambda *a, **k: None), (lambda *a, **k: None)
+        try:
+            env = good_env(HV_SUITE="D1")
+            code = hv.main(env)
+        finally:
+            hv.run_suite, hv.connect, hv.assert_tls = orig
+        d = env["HV_OUT"]
+        ev = json.load(open(os.path.join(d, [f for f in os.listdir(d) if f.endswith(".json")][0])))
+        return code, ev
+
+    def test_d1_clean_run_exits_0(self):
+        code, ev = self._main_with_real_d1()
+        self.assertEqual(ev["verdict"], "PASS")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(ev["results"]["D1"]["cases"]), 15, "observations are in the written evidence")
+        self.assertEqual(len(ev["requests"]), 15)
+
+    def test_d1_platform_rejection_exits_2(self):
+        code, ev = self._main_with_real_d1(probe_reject_over=65536)
+        self.assertTrue(ev["verdict"].startswith("INCONCLUSIVE: chunk sizes not observed for "), ev["verdict"])
+        self.assertEqual(code, 2)
+        self.assertEqual(len([c for c in ev["results"]["D1"]["cases"] if "chunks" in c]), 12)
 
     def test_non_pass_verdicts_exit_2(self):
         for verdict, code in (("PASS", 0), ("INCONCLUSIVE: chunk sizes not observed for D1-1048576-chunked", 2),
@@ -428,7 +466,7 @@ class Integration(unittest.TestCase):
 
     def test_d1(self):
         ctx, st, ev = self.mk("D1")
-        self.assertEqual(hv.run_suite(ctx), "PASS (observations recorded)")
+        self.assertEqual(hv.run_suite(ctx), "PASS")
         cases = ev.doc["results"]["D1"]["cases"]
         self.assertEqual(len(cases), 15)
         for c in cases:
