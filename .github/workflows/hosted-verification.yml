@@ -1,0 +1,291 @@
+# Gearhead Labs STAGING - hosted verification (A4 of the hosted TEST verification procedure, revision 10)
+# File: .github/workflows/hosted-verification.yml in highandmighty354-dev/gearhead-labs-staging ONLY.
+#
+# What this workflow can do: run ONE selected Revision 10 test suite (P1-P2, D1, D3, D4, D2, P3 or P4) against the ONE
+# staging (TEST) project named in this repository's settings, after you approve the run, and keep the evidence as a
+# downloadable artifact. HTTP requests go only to https://<TEST_REF>.supabase.co/functions/v1/(analytics-ingest |
+# b1-chunk-probe); database connections go only to the staging Session pooler, with verify-full TLS against the
+# pinned Supabase roots. Runner: .github/hosted-verification/hv.py (see the README next to it).
+# What it cannot do: start on its own (manual start only), run more than one suite, deploy or configure anything,
+# change function settings, use a service-role key, insert into analytics tables directly, or reach production
+# (production's ref is refused everywhere and production's password is not in this repository).
+#
+# Order of every run:
+#   preflight  (no Environment, no secret)  context, typed ref, four-way target check, TEST origin, the suite's
+#                                           prerequisites, Environment protection, no other staging run active,
+#                                           TLS certificate + hostname probe of the database pooler. No HTTP request.
+#   verify     (Environment staging-db)     WAITS FOR YOUR APPROVAL, then repeats every check in steps that have no
+#                                           secret, installs the hash-pinned database driver, and only the last test
+#                                           step receives the staging database password. Evidence is uploaded after.
+
+name: Hosted verification (manual, approval-gated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "The ONE Revision 10 test suite to run. P1-P2 is read-only. D1/D3 need the A9 probe. D4, D2, P3, P4 need the A7 receiver and the A8 test window."
+        type: choice
+        options: ["P1-P2", "D1", "D3", "D4", "D2", "P3", "P4"]
+        required: true
+      confirm_project_ref:
+        description: "Type the STAGING project ref exactly (20 lowercase letters/digits). Production's ref is always refused."
+        type: string
+        required: true
+
+# No permissions at workflow level; each job asks only for read access.
+permissions: {}
+
+# Shares the repository-wide group with the migration and validation workflows: GitHub runs at most one of them at a
+# time and never cancels a running one. A newer queued run in the group replaces an older one still pending (GitHub's
+# rule), so start one run at a time. check_no_other_runs is a separate point-in-time check, not a lock.
+concurrency:
+  group: staging-migrations
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash   # GitHub runs this as: bash --noprofile --norc -eo pipefail {0}
+
+env:
+  STAGING_REPOSITORY: "highandmighty354-dev/gearhead-labs-staging"
+  PRODUCTION_REF: "jmztpjudwzjvrcdtjynd"     # always refused, everywhere
+  NO_COLOR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Approval gate this workflow requires (read back from GitHub before anything runs; see check_environment).
+  APPROVAL_ENVIRONMENT: "staging-db"
+  APPROVER_LOGIN: "highandmighty354-dev"     # the ONLY required reviewer; must be the owner's personal GitHub login
+  # Trusted roots for the database's TLS certificate: Supabase's two production root CAs, exactly as shipped in
+  # github.com/supabase/cli at tag v2.119.0 (commit 3cb948c5a70d31fbcb0fd1dcc616ee196a125cd0), files
+  # apps/cli-go/internal/gen/types/templates/prod-ca-2021.crt and prod-ca-2025.crt. No system CA store is used.
+  #   prod-ca-2021: CN=Supabase Root 2021 CA, valid 2021-04-28 to 2031-04-26
+  #   prod-ca-2025: CN=Supabase Root 2021 CA (re-keyed), valid 2025-09-03 to 2035-09-01
+  SUPABASE_ROOT_CA_SHA256_FINGERPRINTS: "5F9B77951A7AA1303F9B58EEA9BFA89E358CFDC15F9786FF10D4930A722C9AE2 807025AD50D4ED219D2C9C7D299C004F824EB00CF7F65AFEF607D07B72E6CAFA"
+  SUPABASE_ROOT_CA_PEM: |
+    -----BEGIN CERTIFICATE-----
+    MIIDxDCCAqygAwIBAgIUbLxMod62P2ktCiAkxnKJwtE9VPYwDQYJKoZIhvcNAQEL
+    BQAwazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l
+    dyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJh
+    c2UgUm9vdCAyMDIxIENBMB4XDTIxMDQyODEwNTY1M1oXDTMxMDQyNjEwNTY1M1ow
+    azELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5ldyBD
+    YXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug
+    Um9vdCAyMDIxIENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqQXW
+    QyHOB+qR2GJobCq/CBmQ40G0oDmCC3mzVnn8sv4XNeWtE5XcEL0uVih7Jo4Dkx1Q
+    DmGHBH1zDfgs2qXiLb6xpw/CKQPypZW1JssOTMIfQppNQ87K75Ya0p25Y3ePS2t2
+    GtvHxNjUV6kjOZjEn2yWEcBdpOVCUYBVFBNMB4YBHkNRDa/+S4uywAoaTWnCJLUi
+    cvTlHmMw6xSQQn1UfRQHk50DMCEJ7Cy1RxrZJrkXXRP3LqQL2ijJ6F4yMfh+Gyb4
+    O4XajoVj/+R4GwywKYrrS8PrSNtwxr5StlQO8zIQUSMiq26wM8mgELFlS/32Uclt
+    NaQ1xBRizkzpZct9DwIDAQABo2AwXjALBgNVHQ8EBAMCAQYwHQYDVR0OBBYEFKjX
+    uXY32CztkhImng4yJNUtaUYsMB8GA1UdIwQYMBaAFKjXuXY32CztkhImng4yJNUt
+    aUYsMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAB8spzNn+4VU
+    tVxbdMaX+39Z50sc7uATmus16jmmHjhIHz+l/9GlJ5KqAMOx26mPZgfzG7oneL2b
+    VW+WgYUkTT3XEPFWnTp2RJwQao8/tYPXWEJDc0WVQHrpmnWOFKU/d3MqBgBm5y+6
+    jB81TU/RG2rVerPDWP+1MMcNNy0491CTL5XQZ7JfDJJ9CCmXSdtTl4uUQnSuv/Qx
+    Cea13BX2ZgJc7Au30vihLhub52De4P/4gonKsNHYdbWjg7OWKwNv/zitGDVDB9Y2
+    CMTyZKG3XEu5Ghl1LEnI3QmEKsqaCLv12BnVjbkSeZsMnevJPs1Ye6TjjJwdik5P
+    o/bKiIz+Fq8=
+    -----END CERTIFICATE-----
+    -----BEGIN CERTIFICATE-----
+    MIIDxzCCAq+gAwIBAgIUeX+gpfmsRW9asFkRvjyXjHxbfgcwDQYJKoZIhvcNAQEL
+    BQAwazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l
+    dyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJh
+    c2UgUm9vdCAyMDIxIENBMB4XDTI1MDkwMzA4MDEyNVoXDTM1MDkwMTA4MDEyNVow
+    azELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5ldyBD
+    YXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug
+    Um9vdCAyMDIxIENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5Ve7
+    i9UAmc7luUilELPtqzEk8nGHxg7nY0aCStr625M7+K4OPO6RUllTsHh47k1jWyzm
+    LXLlyYwCsYCjQp+3vn06H+F/HRUxBt6CK2B7bNng230exTunk0xFvfkX6YgHR7B3
+    1B7L25Rq3PhuRFPV4hnGYRam2XBZC4UNPqoAgrhV0HOYzXXAVoTr2yaBTMnB331Z
+    RwOmINh7eqTCk/JRZbb6vfZOhZRAVAe9AoRLoG8aKwmeoLGwlu0UuFx6z3E+6bmA
+    fSNa8Lx02GEoCdPLw9IRKUFq/SgBpQUKm44H1fDwTjH2CMM0N4p0mL/6wXnNeHvt
+    C40MmKZ0RcVmHE5wBwIDAQABo2MwYTAdBgNVHQ4EFgQUjvEE541toZcwtXQlZlcB
+    YOBRTnowHwYDVR0jBBgwFoAUjvEE541toZcwtXQlZlcBYOBRTnowDwYDVR0TAQH/
+    BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggEBACD5IcGP
+    XKvS9qg0CgEQPFqYavt5c7P+0xxFgiZe+xoG8fUw58yNeK2APtgGPRpxEOGfAlNx
+    z9HDt4gcyHEE00B3qAVDm49pqNxioFWzNqU2LGfM/HL1QmN6urR7hCOkVCJddvOc
+    FhFX4nZDuRfaBboDvS5HlK3Pzxddp9hvrJi2bemr8HLqYc3HzmVckgPGSLML6t+h
+    4LRCXSlQsDgQ1LZ4KHsl4cq7K51N6FOXQBLB5q4lMKhs0VUhCT8Pdsj12+84laCV
+    c22q6p2mdT9SaernCSRnWazXWisgpjv3H7Ex4S1DCYjJIwn3PUToGFv1r8YRN2/S
+    O19yVSxxCIf64Sg=
+    -----END CERTIFICATE-----
+
+jobs:
+  preflight:
+    name: Preflight checks (no approval needed, no secret, no HTTP request)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read    # read-only: Environment protection settings and other runs' status
+    env:
+      EVENT: ${{ github.event_name }}
+      REPO: ${{ github.repository }}
+      GIT_REF: ${{ github.ref }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      RUN_ID: ${{ github.run_id }}
+      SUITE: ${{ inputs.suite }}
+      EXPECTED_TEST_REF: ${{ vars.EXPECTED_TEST_REF }}
+      POOLER_URL: ${{ vars.STAGING_POOLER_URL }}
+      CONFIRM_REF: ${{ inputs.confirm_project_ref }}
+      ANALYTICS_TEST_ORIGIN: ${{ vars.ANALYTICS_TEST_ORIGIN }}
+      HV_PROBE_STATUS: ${{ vars.HV_PROBE_STATUS }}
+      HV_RECEIVER_STATUS: ${{ vars.HV_RECEIVER_STATUS }}
+      HV_TEST_WINDOW: ${{ vars.HV_TEST_WINDOW }}
+      COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check how the run was started (before checkout)
+        run: |
+          [ "$EVENT" = workflow_dispatch ] || { echo "HARD FAIL: not started by the Run workflow button" >&2; exit 1; }
+          [ "$GIT_REF" = refs/heads/main ] || { echo "HARD FAIL: not started from main" >&2; exit 1; }
+          [ "$RUN_ATTEMPT" = 1 ] || { echo "HARD FAIL: re-runs are refused; start a new run" >&2; exit 1; }
+
+      - name: Check out this exact commit (read-only, no stored credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Context, target, origin and prerequisites
+        run: |
+          . .github/hosted-verification/checks.sh
+          [ "$(git rev-parse HEAD)" = "$COMMIT" ] || fail "checked-out commit is not the run's commit"
+          check_context
+          ref="$(verify_target)"
+          check_origin | tee "$RUNNER_TEMP/origin.txt"
+          check_prerequisites | tee "$RUNNER_TEMP/prereq.txt"
+          {
+            echo "### Hosted verification preflight passed - suite $SUITE"
+            echo "- Commit: \`$COMMIT\`; manual start from main, first attempt"
+            echo "- Target: staging project \`$ref\` (variable, pooler URL, typed ref and supabase-config.js agree; production \`$PRODUCTION_REF\` refused)"
+            echo "- $(cat "$RUNNER_TEMP/origin.txt")"
+            echo "- $(cat "$RUNNER_TEMP/prereq.txt")"
+            echo "- No HTTP request has been sent. Next: the verify job waits for your approval in the staging-db Environment"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the approval gate settings and other runs (read-only, no secret)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . .github/hosted-verification/checks.sh
+          check_environment | tee -a "$GITHUB_STEP_SUMMARY"
+          check_no_other_runs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the database's TLS certificate and hostname (no password)
+        run: |
+          . .github/hosted-verification/checks.sh
+          verify_target > /dev/null
+          write_ca "$RUNNER_TEMP/supabase-root-ca.pem"
+          tls_probe "$(pooler_host)" "$RUNNER_TEMP/supabase-root-ca.pem" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Suite ${{ inputs.suite }} - staging project
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: staging-db    # required reviewer = you; main branch only. Nothing below starts until you approve.
+    permissions:
+      contents: read
+      actions: read    # read-only: Environment protection settings and other runs' status
+    env:
+      EVENT: ${{ github.event_name }}
+      REPO: ${{ github.repository }}
+      GIT_REF: ${{ github.ref }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      RUN_ID: ${{ github.run_id }}
+      SUITE: ${{ inputs.suite }}
+      EXPECTED_TEST_REF: ${{ vars.EXPECTED_TEST_REF }}
+      POOLER_URL: ${{ vars.STAGING_POOLER_URL }}
+      CONFIRM_REF: ${{ inputs.confirm_project_ref }}
+      ANALYTICS_TEST_ORIGIN: ${{ vars.ANALYTICS_TEST_ORIGIN }}
+      HV_PROBE_STATUS: ${{ vars.HV_PROBE_STATUS }}
+      HV_RECEIVER_STATUS: ${{ vars.HV_RECEIVER_STATUS }}
+      HV_TEST_WINDOW: ${{ vars.HV_TEST_WINDOW }}
+      COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check how the run was started (before checkout)
+        run: |
+          [ "$EVENT" = workflow_dispatch ] || { echo "HARD FAIL: not started by the Run workflow button" >&2; exit 1; }
+          [ "$GIT_REF" = refs/heads/main ] || { echo "HARD FAIL: not started from main" >&2; exit 1; }
+          [ "$RUN_ATTEMPT" = 1 ] || { echo "HARD FAIL: re-runs are refused; start a new run" >&2; exit 1; }
+
+      - name: Check out the same commit preflight checked
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Repeat every check after approval (no secret in this step)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . .github/hosted-verification/checks.sh
+          [ "$(git rev-parse HEAD)" = "$COMMIT" ] || fail "checked-out commit is not the run's commit"
+          check_context
+          verify_target > /dev/null
+          check_origin
+          check_prerequisites
+          check_environment | tee "$RUNNER_TEMP/approval.txt"
+          check_no_other_runs
+
+      - name: Install the database driver, hash-pinned (no secret in this step)
+        run: |
+          . .github/hosted-verification/checks.sh
+          python3 -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' || fail "python3 on this runner is not 3.12: the pinned wheels do not apply"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --require-hashes --no-deps --only-binary :all: \
+            -r .github/hosted-verification/requirements.txt || fail "the pinned database driver could not be installed"
+          "$RUNNER_TEMP/venv/bin/python" -c 'import psycopg; print("psycopg", psycopg.__version__, "libpq", psycopg.pq.version())'
+
+      - name: Re-check the database's TLS certificate and hostname (no secret in this step)
+        run: |
+          . .github/hosted-verification/checks.sh
+          write_ca "$RUNNER_TEMP/supabase-root-ca.pem"
+          tls_probe "$(pooler_host)" "$RUNNER_TEMP/supabase-root-ca.pem" | tee "$RUNNER_TEMP/tls.txt"
+
+      - name: Run suite ${{ inputs.suite }} (the only step that receives the password)
+        env:
+          DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+        run: |
+          . .github/hosted-verification/checks.sh
+          [ -n "${DB_PASSWORD:-}" ] || fail "Environment secret STAGING_DB_PASSWORD is not set"
+          CA_FILE="$RUNNER_TEMP/db-ca.pem"
+          write_ca "$CA_FILE"
+          # Connection string, built here only and masked before anything else is printed (same construction and checks
+          # as the migration workflow). It is passed to the runner process only, never written to a file or the summary.
+          enc="$(python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["DB_PASSWORD"],safe=""))')"
+          echo "::add-mask::$enc"
+          DB_URL="${POOLER_URL/\[YOUR-PASSWORD\]/$enc}?sslmode=verify-full&sslrootcert=$CA_FILE"
+          echo "::add-mask::$DB_URL"
+          unset DB_PASSWORD enc
+          case "$DB_URL" in *"$PRODUCTION_REF"*) fail "the final connection string names the PRODUCTION project" ;; esac
+          case "$DB_URL" in "postgresql://postgres.$EXPECTED_TEST_REF:"*|"postgres://postgres.$EXPECTED_TEST_REF:"*) ;; *) fail "the final connection string is not for $EXPECTED_TEST_REF" ;; esac
+          case "$DB_URL" in *"@$(pooler_host):5432/postgres?sslmode=verify-full&sslrootcert=$CA_FILE") ;; *) fail "the final connection string does not require verify-full against the pinned roots" ;; esac
+          [ "$(printf '%s' "$DB_URL" | grep -o 'sslmode=' | wc -l)" = 1 ] || fail "the final connection string sets sslmode more than once"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          rc=0
+          HV_DB_URL="$DB_URL" HV_CA_FILE="$CA_FILE" HV_OUT="$RUNNER_TEMP/evidence" HV_SUITE="$SUITE" \
+            HV_RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            HV_APPROVAL_RESULT="$(cat "$RUNNER_TEMP/approval.txt")" HV_TLS_RESULT="$(tail -1 "$RUNNER_TEMP/tls.txt")" \
+            "$RUNNER_TEMP/venv/bin/python" -I .github/hosted-verification/hv.py > "$RUNNER_TEMP/runner.out" 2>&1 || rc=$?
+          unset DB_URL
+          cat "$RUNNER_TEMP/runner.out"
+          {
+            echo "### Suite $SUITE - staging project \`$EXPECTED_TEST_REF\`"
+            echo "- Commit \`$COMMIT\`, run $GITHUB_RUN_ID, attempt 1"
+            sed -n 's/^verdict: /- **Verdict:** /p; s/^evidence: /- Evidence: /p; s/^HARD FAIL: /- **Refused:** /p' "$RUNNER_TEMP/runner.out"
+            echo "- Evidence files are in this run's artifact. A verdict other than PASS is reported, never converted into a pass."
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$rc" in
+            0) echo "Suite $SUITE: PASS. Next: report to the owner and STOP." ;;
+            2) fail "suite $SUITE finished with a verdict other than PASS (see the evidence)" ;;
+            *) fail "suite $SUITE was refused or failed (status $rc; see above)" ;;
+          esac
+
+      - name: Upload the evidence (written and checked for secrets by the runner)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: hosted-verification-${{ inputs.suite }}-run${{ github.run_id }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 90

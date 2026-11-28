@@ -1,0 +1,155 @@
+{
+ "source": "Revision 10 D3: the exact B2-7 byte sequences of premium-foundation/tests/analytics.test.js (gearhead-labs main 215b1a0, SHA-256 7cc1358b...e5), each wrapped as in B2-7, and the leading byte-order mark. code_points: what Node 22's TextDecoder('utf-8') (the decoder readBodyLimited() uses) produced locally; tests/test_hv.py re-derives them.",
+ "cases": [
+  {
+   "id": "B2-7-fffe",
+   "bytes": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    255,
+    254,
+    34,
+    125
+   ],
+   "code_points": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    65533,
+    65533,
+    34,
+    125
+   ]
+  },
+  {
+   "id": "B2-7-8041",
+   "bytes": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    128,
+    65,
+    34,
+    125
+   ],
+   "code_points": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    65533,
+    65,
+    34,
+    125
+   ]
+  },
+  {
+   "id": "B2-7-e282",
+   "bytes": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    226,
+    130,
+    34,
+    125
+   ],
+   "code_points": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    65533,
+    34,
+    125
+   ]
+  },
+  {
+   "id": "B2-7-c0af",
+   "bytes": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    192,
+    175,
+    34,
+    125
+   ],
+   "code_points": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    65533,
+    65533,
+    34,
+    125
+   ]
+  },
+  {
+   "id": "B2-7-eda080",
+   "bytes": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    237,
+    160,
+    128,
+    34,
+    125
+   ],
+   "code_points": [
+    123,
+    34,
+    97,
+    34,
+    58,
+    34,
+    65533,
+    65533,
+    65533,
+    34,
+    125
+   ]
+  },
+  {
+   "id": "B2-7-bom",
+   "bytes": [
+    239,
+    187,
+    191,
+    123,
+    125
+   ],
+   "code_points": [
+    123,
+    125
+   ]
+  }
+ ]
+}
